@@ -42,8 +42,12 @@ final class DualDeepgramASR {
     private let enLeg = Leg(lang: .en)
     private var keepAlive: Timer?
     private let downsampler = MicDownsampler()
+    private var apiKey = ""
+    private var closing = false
 
     func connect(apiKey: String) {
+        self.apiKey = apiKey
+        closing = false
         open(leg: zhLeg, language: "zh-CN", apiKey: apiKey)
         open(leg: enLeg, language: "en-US", apiKey: apiKey)
         // 只在说话时上送音频,静默期靠 KeepAlive 维持连接不被服务端关闭
@@ -76,6 +80,7 @@ final class DualDeepgramASR {
     }
 
     func disconnect() {
+        closing = true
         keepAlive?.invalidate()
         keepAlive = nil
         zhLeg.socket?.cancel(with: .goingAway, reason: nil)
@@ -135,9 +140,17 @@ final class DualDeepgramASR {
         leg.socket?.receive { [weak self] result in
             guard let self else { return }
             switch result {
-            case .failure(let error):
-                let name = leg.lang == .zh ? "中文" : "英文"
-                self.onError?("识别连接断开(\(name)路): \(error.localizedDescription)。停止后重新开始即可重连。")
+            case .failure:
+                // 网络切换(如 Wi-Fi/5G/LTE 互切)会掐断长连接,这里自动重连,不打扰用户
+                guard !self.closing else { return }
+                leg.socket = nil
+                leg.resetUtterance()
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    guard let self, !self.closing else { return }
+                    self.open(leg: leg,
+                              language: leg.lang == .zh ? "zh-CN" : "en-US",
+                              apiKey: self.apiKey)
+                }
             case .success(let message):
                 if case .string(let text) = message {
                     self.handle(text, leg: leg)
