@@ -19,18 +19,27 @@ final class AudioManager {
 
     func configureSession() throws {
         let session = AVAudioSession.sharedInstance()
-        // voiceChat 模式自带回声消除(AEC),减少耳机漏音被麦克风重新录进去的问题。
-        // 只允许 A2DP 蓝牙输出,不允许 HFP,保证耳机端音质。
+        // 只允许 A2DP 蓝牙输出保证耳机音质;不用 voiceChat 和 defaultToSpeaker,
+        // 否则 iOS 会把输出强制按在手机喇叭上,耳机没声。
+        // 半双工设计(播报时不收音)本身就避免了回声,不需要 voiceChat 的回声消除。
         try session.setCategory(
             .playAndRecord,
-            mode: .voiceChat,
-            options: [.allowBluetoothA2DP, .defaultToSpeaker]
+            mode: .default,
+            options: [.allowBluetoothA2DP]
         )
         try session.setActive(true)
 
         // 强制用 iPhone 自带麦克风收音,耳机只做输出
         if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
             try? session.setPreferredInput(builtIn)
+        }
+
+        // 没连蓝牙耳机时,把输出切到扬声器(否则默认走听筒,声音很小)
+        let hasBluetooth = session.currentRoute.outputs.contains {
+            $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE || $0.portType == .bluetoothHFP
+        }
+        if !hasBluetooth {
+            try? session.overrideOutputAudioPort(.speaker)
         }
     }
 
