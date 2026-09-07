@@ -1,230 +1,285 @@
-import Foundation
+import SwiftUI
+import Combine
+import Translation
 import AVFoundation
 
-/// 双路 Deepgram 流式识别。
+/// 整条流水线的调度中心,支持两套引擎:
 ///
-/// nova-3 的 multi 混合模式目前不含中文,所以照搬 v1 验证过的双路思路:
-/// 中文和英文各开一条 websocket,同一段音频同时上送,
-/// 句尾发 Finalize 强制出终稿,比较两路整体置信度自动判定语种。
-/// 专语言模型的准确率也比混合模式更高。
-final class DualDeepgramASR {
-    struct Utterance {
-        let text: String
-        let lang: Lang
+/// 端上(v1,离线免费):
+///   麦克风 -> VAD 断句 -> 双路 SFSpeech 识别判语种 -> Translation 框架翻译
+///   -> AVSpeechSynthesizer 合成 -> 对应声道播放
+///
+/// 云端(v2,低延迟高质量):
+///   麦克风 -> VAD 断句 -> 双路 Deepgram 流式识别判语种
+///   -> Claude 流式翻译(带上下文) -> 按句切分 -> ElevenLabs 流式合成
+///   -> 音频块边到边播,首句不等整段翻完
+@MainActor
+final class TranslatorCore: ObservableObject {
+    enum PipelineState {
+        case idle, listening, translating, playing
     }
 
-    var onPartial: ((String) -> Void)?
-    var onError: ((String) -> Void)?
-
-    private final class Leg {
-        let lang: Lang
-        var socket: URLSessionWebSocketTask?
-        var pending = ""
-        var confidenceSum: Double = 0
-        var confidenceCount = 0
-        var finalized = false
-
-        init(lang: Lang) { self.lang = lang }
-
-        var confidence: Double {
-            confidenceCount == 0 ? 0 : confidenceSum / Double(confidenceCount)
-        }
-
-        func resetUtterance() {
-            pending = ""
-            confidenceSum = 0
-            confidenceCount = 0
-            finalized = false
-        }
+    enum Engine: String, CaseIterable {
+        case onDevice
+        case cloud
     }
 
-    private let zhLeg = Leg(lang: .zh)
-    private let enLeg = Leg(lang: .en)
-    private var keepAlive: Timer?
-    private let downsampler = MicDownsampler()
-    private var apiKey = ""
-    private var closing = false
+    @Published var running = false
+    @Published var state: PipelineState = .idle
+    @Published var partialText = ""
+    @Published var entries: [TranscriptEntry] = []
+    @Published var errorMessage: String?
 
-    func connect(apiKey: String) {
-        self.apiKey = apiKey
-        closing = false
-        open(leg: zhLeg, language: "zh-CN", apiKey: apiKey)
-        open(leg: enLeg, language: "en-US", apiKey: apiKey)
-        // 只在说话时上送音频,静默期靠 KeepAlive 维持连接不被服务端关闭
-        keepAlive = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            let ping = URLSessionWebSocketTask.Message.string(#"{"type":"KeepAlive"}"#)
-            self?.zhLeg.socket?.send(ping) { _ in }
-            self?.enLeg.socket?.send(ping) { _ in }
-        }
+    // 通用设置
+    @Published var zhOnLeft = true          // 中文译文送到左耳(说中文的人戴左耳)
+    @Published var speechRate: Float = 0.5  // 端上引擎的播报语速
+    @Published var vadThreshold: Float = 0.015
+
+    // 引擎选择与云端凭据(Key 存钥匙串)
+    @Published var engine: Engine = Engine(rawValue: UserDefaults.standard.string(forKey: "engine") ?? "") ?? .onDevice {
+        didSet { UserDefaults.standard.set(engine.rawValue, forKey: "engine") }
+    }
+    @Published var deepgramKey: String = KeychainStore.get("deepgramKey") {
+        didSet { KeychainStore.set(deepgramKey, for: "deepgramKey") }
+    }
+    @Published var anthropicKey: String = KeychainStore.get("anthropicKey") {
+        didSet { KeychainStore.set(anthropicKey, for: "anthropicKey") }
+    }
+    @Published var elevenKey: String = KeychainStore.get("elevenKey") {
+        didSet { KeychainStore.set(elevenKey, for: "elevenKey") }
+    }
+    @Published var elevenVoiceId: String = UserDefaults.standard.string(forKey: "voiceId") ?? "21m00Tcm4TlvDq8ikWAM" {
+        didSet { UserDefaults.standard.set(elevenVoiceId, forKey: "voiceId") }
     }
 
-    private func open(leg: Leg, language: String, apiKey: String) {
-        var components = URLComponents(string: "wss://api.deepgram.com/v1/listen")!
-        components.queryItems = [
-            .init(name: "model", value: "nova-3"),
-            .init(name: "language", value: language),
-            .init(name: "encoding", value: "linear16"),
-            .init(name: "sample_rate", value: "16000"),
-            .init(name: "channels", value: "1"),
-            .init(name: "interim_results", value: "true"),
-            .init(name: "smart_format", value: "true"),
-            .init(name: "punctuate", value: "true"),
-            .init(name: "endpointing", value: "false"), // 断句由 App 端 VAD 决定
-        ]
-        var request = URLRequest(url: components.url!)
-        request.setValue("Token \(apiKey)", forHTTPHeaderField: "Authorization")
-        let task = URLSession.shared.webSocketTask(with: request)
-        leg.socket = task
-        task.resume()
-        receiveLoop(leg)
+    // 端上翻译会话由 ContentView 的 translationTask 注入
+    var zhToEn: TranslationSession?
+    var enToZh: TranslationSession?
+
+    private let audio = AudioManager()
+    private let detector = UtteranceDetector()
+    private let localRecognizer = DualRecognizer()
+    private let localSynth = SpeechSynth()
+    private let cloudASR = DualDeepgramASR()
+    private let cloudTranslator = ClaudeTranslator()
+    private let cloudTTS = ElevenLabsTTS()
+    private var bag = Set<AnyCancellable>()
+
+    init() {
+        $vadThreshold
+            .sink { [detector] value in detector.threshold = value }
+            .store(in: &bag)
     }
 
-    func disconnect() {
-        closing = true
-        keepAlive?.invalidate()
-        keepAlive = nil
-        zhLeg.socket?.cancel(with: .goingAway, reason: nil)
-        enLeg.socket?.cancel(with: .goingAway, reason: nil)
-        zhLeg.socket = nil
-        enLeg.socket = nil
-        zhLeg.resetUtterance()
-        enLeg.resetUtterance()
+    func toggle() {
+        running ? stop() : start()
     }
 
-    /// 一句话开始(VAD 触发,音频线程调用)
-    func beginUtterance() {
-        zhLeg.resetUtterance()
-        enLeg.resetUtterance()
-    }
-
-    /// 音频线程:降采样到 16k s16le 后同时上送两条腿
-    func append(_ buffer: AVAudioPCMBuffer) {
-        guard let data = downsampler.convert(buffer) else { return }
-        zhLeg.socket?.send(.data(data)) { _ in }
-        enLeg.socket?.send(.data(data)) { _ in }
-    }
-
-    /// 句尾:Finalize 两条腿,等终稿(最多 2 秒)后比较置信度定语种
-    func endUtterance() async -> Utterance? {
-        let finalize = URLSessionWebSocketTask.Message.string(#"{"type":"Finalize"}"#)
-        zhLeg.socket?.send(finalize) { _ in }
-        enLeg.socket?.send(finalize) { _ in }
-
-        let deadline = Date().addingTimeInterval(2.0)
-        while Date() < deadline, !(zhLeg.finalized && enLeg.finalized) {
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-
-        let zhText = zhLeg.pending.trimmingCharacters(in: .whitespacesAndNewlines)
-        let enText = enLeg.pending.trimmingCharacters(in: .whitespacesAndNewlines)
-        let zhConfidence = zhLeg.confidence
-        let enConfidence = enLeg.confidence
-        zhLeg.resetUtterance()
-        enLeg.resetUtterance()
-
-        if zhText.isEmpty && enText.isEmpty { return nil }
-        if zhText.isEmpty { return Utterance(text: enText, lang: .en) }
-        if enText.isEmpty { return Utterance(text: zhText, lang: .zh) }
-
-        // 先看置信度差距,再用汉字占比兜底
-        if zhConfidence > enConfidence + 0.08 { return Utterance(text: zhText, lang: .zh) }
-        if enConfidence > zhConfidence + 0.08 { return Utterance(text: enText, lang: .en) }
-        let hanCount = zhText.unicodeScalars.filter { $0.properties.isIdeographic }.count
-        let hanRatio = Double(hanCount) / Double(max(zhText.count, 1))
-        return hanRatio > 0.4
-            ? Utterance(text: zhText, lang: .zh)
-            : Utterance(text: enText, lang: .en)
-    }
-
-    private func receiveLoop(_ leg: Leg) {
-        leg.socket?.receive { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure:
-                // 网络切换(如 Wi-Fi/5G/LTE 互切)会掐断长连接,这里自动重连,不打扰用户
-                guard !self.closing else { return }
-                leg.socket = nil
-                leg.resetUtterance()
-                DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                    guard let self, !self.closing else { return }
-                    self.open(leg: leg,
-                              language: leg.lang == .zh ? "zh-CN" : "en-US",
-                              apiKey: self.apiKey)
-                }
-            case .success(let message):
-                if case .string(let text) = message {
-                    self.handle(text, leg: leg)
-                }
-                self.receiveLoop(leg)
+    func start() {
+        Task {
+            let micOK = await AVAudioApplication.requestRecordPermission()
+            guard micOK else {
+                errorMessage = "需要麦克风权限,请到 设置 > 隐私与安全 中开启"
+                return
             }
-        }
-    }
-
-    private func handle(_ raw: String, leg: Leg) {
-        guard let data = raw.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (obj["type"] as? String) == "Results",
-              let channel = obj["channel"] as? [String: Any],
-              let alternatives = channel["alternatives"] as? [[String: Any]],
-              let first = alternatives.first else { return }
-
-        let transcript = ((first["transcript"] as? String) ?? "")
-            .trimmingCharacters(in: .whitespaces)
-        let isFinal = obj["is_final"] as? Bool ?? false
-        let fromFinalize = obj["from_finalize"] as? Bool ?? false
-
-        if isFinal {
-            if !transcript.isEmpty {
-                leg.pending += leg.pending.isEmpty ? transcript : " " + transcript
-                if let confidence = first["confidence"] as? Double {
-                    leg.confidenceSum += confidence
-                    leg.confidenceCount += 1
+            if engine == .onDevice {
+                let speechOK = await DualRecognizer.requestPermission()
+                guard speechOK else {
+                    errorMessage = "需要语音识别权限,请到 设置 > 隐私与安全 中开启"
+                    return
+                }
+            } else {
+                guard !deepgramKey.isEmpty, !anthropicKey.isEmpty, !elevenKey.isEmpty else {
+                    errorMessage = "云端模式需要先在设置里填入 Deepgram / Anthropic / ElevenLabs 三个 API Key"
+                    return
                 }
             }
-            if fromFinalize {
-                leg.finalized = true
+            do {
+                try audio.configureSession()
+                engine == .onDevice ? wireLocal() : wireCloud()
+                try audio.start()
+                running = true
+                state = .listening
+                errorMessage = nil
+            } catch {
+                errorMessage = "音频启动失败: \(error.localizedDescription)"
             }
-        } else if !transcript.isEmpty {
-            // 两路的中间结果都往界面推,后到者覆盖,只为显示"正在听懂"
-            onPartial?(leg.pending.isEmpty ? transcript : leg.pending + " " + transcript)
         }
     }
-}
 
-/// 麦克风缓冲降采样到 Deepgram 需要的 16k 单声道 s16le
-final class MicDownsampler {
-    private var converter: AVAudioConverter?
-    private let outFormat = AVAudioFormat(
-        commonFormat: .pcmFormatInt16,
-        sampleRate: 16_000,
-        channels: 1,
-        interleaved: true
-    )!
+    func stop() {
+        audio.stop()
+        localRecognizer.cancel()
+        cloudASR.disconnect()
+        cloudTranslator.reset()
+        detector.reset()
+        running = false
+        state = .idle
+        partialText = ""
+    }
 
-    func convert(_ buffer: AVAudioPCMBuffer) -> Data? {
-        if converter == nil {
-            converter = AVAudioConverter(from: buffer.format, to: outFormat)
-        }
-        guard let converter else { return nil }
-        let ratio = outFormat.sampleRate / buffer.format.sampleRate
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
-        guard let out = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: capacity) else {
-            return nil
-        }
-        var served = false
-        var error: NSError?
-        converter.convert(to: out, error: &error) { _, status in
-            if served {
-                status.pointee = .noDataNow
-                return nil
+    /// 端上模式:触发系统翻译模型下载(首次使用需要)
+    func downloadLanguages() {
+        Task {
+            do {
+                try await zhToEn?.prepareTranslation()
+                try await enToZh?.prepareTranslation()
+                errorMessage = nil
+            } catch {
+                errorMessage = "语言包准备失败: \(error.localizedDescription)"
             }
-            served = true
-            status.pointee = .haveData
-            return buffer
         }
-        guard error == nil, out.frameLength > 0, let channel = out.int16ChannelData else {
-            return nil
+    }
+
+    // MARK: - 端上管线(v1)
+
+    private func wireLocal() {
+        localRecognizer.onPartial = { [weak self] text in
+            Task { @MainActor in self?.partialText = text }
         }
-        return Data(bytes: channel[0], count: Int(out.frameLength) * 2)
+        detector.threshold = vadThreshold
+        detector.onStart = { [localRecognizer] in localRecognizer.begin() }
+        detector.forward = { [localRecognizer] buffer in localRecognizer.append(buffer) }
+        detector.onEnd = { [weak self] in
+            Task { @MainActor in await self?.finishLocalUtterance() }
+        }
+        detector.reset()
+        audio.onBuffer = { [detector] buffer in detector.feed(buffer) }
+    }
+
+    private func finishLocalUtterance() async {
+        state = .translating
+        defer {
+            detector.resume()
+            if running { state = .listening }
+        }
+
+        guard let (text, lang) = await localRecognizer.end() else {
+            partialText = ""
+            return
+        }
+        partialText = ""
+
+        guard let session = (lang == .zh ? zhToEn : enToZh) else {
+            errorMessage = "翻译引擎未就绪,请先点「下载语言包」"
+            return
+        }
+
+        do {
+            let response = try await session.translate(text)
+            entries.append(TranscriptEntry(lang: lang, original: text, translation: response.targetText))
+            errorMessage = nil
+
+            state = .playing
+            let targetLang = lang.opposite
+            let buffers = await localSynth.render(
+                response.targetText,
+                lang: targetLang,
+                to: audio.playbackFormat,
+                rate: speechRate
+            )
+            let playOnLeft = (targetLang == .zh) ? zhOnLeft : !zhOnLeft
+            await audio.play(buffers: buffers, onLeft: playOnLeft)
+        } catch {
+            errorMessage = "翻译失败: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - 云端管线(v2)
+
+    private func wireCloud() {
+        cloudASR.onPartial = { [weak self] text in
+            Task { @MainActor in self?.partialText = text }
+        }
+        cloudASR.onError = { [weak self] message in
+            Task { @MainActor in self?.errorMessage = message }
+        }
+        cloudASR.connect(apiKey: deepgramKey)
+
+        detector.threshold = vadThreshold
+        detector.onStart = { [cloudASR] in cloudASR.beginUtterance() }
+        detector.forward = { [cloudASR] buffer in cloudASR.append(buffer) }
+        detector.onEnd = { [weak self] in
+            Task { @MainActor in await self?.finishCloudUtterance() }
+        }
+        detector.reset()
+        audio.onBuffer = { [detector] buffer in detector.feed(buffer) }
+    }
+
+    private func finishCloudUtterance() async {
+        state = .translating
+        defer {
+            detector.resume()
+            if running { state = .listening }
+        }
+
+        guard let utterance = await cloudASR.endUtterance() else {
+            partialText = ""
+            return
+        }
+        partialText = ""
+
+        let lang = utterance.lang
+        let targetLang = lang.opposite
+        let playOnLeft = (targetLang == .zh) ? zhOnLeft : !zhOnLeft
+        var full = ""
+        var chunk = ""
+
+        do {
+            // Claude 逐 token 返回;攒到句子边界就先送去合成,
+            // 首句音频不等整段翻完,音频块到一块播一块
+            for try await token in cloudTranslator.stream(text: utterance.text, from: lang, apiKey: anthropicKey) {
+                full += token
+                chunk += token
+                while let sentence = Self.takeSentence(&chunk) {
+                    state = .playing
+                    await speakSentence(sentence, lang: targetLang, playOnLeft: playOnLeft)
+                }
+            }
+            let rest = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !rest.isEmpty {
+                state = .playing
+                await speakSentence(rest, lang: targetLang, playOnLeft: playOnLeft)
+            }
+
+            let translation = full.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !translation.isEmpty else { return }
+            entries.append(TranscriptEntry(lang: lang, original: utterance.text, translation: translation))
+            cloudTranslator.remember(source: utterance.text, target: translation, lang: lang)
+            errorMessage = nil
+
+            // 等这个声道队列里的音频全部播完再恢复聆听
+            await audio.finishStream(onLeft: playOnLeft)
+        } catch {
+            errorMessage = "云端管线出错: \(error.localizedDescription)"
+        }
+    }
+
+    /// 播一句译文:优先 ElevenLabs 云端音色,失败(如免费档限流)自动降级系统语音,保证对话不中断
+    private func speakSentence(_ text: String, lang: Lang, playOnLeft: Bool) async {
+        do {
+            try await cloudTTS.stream(text: text, apiKey: elevenKey, voiceId: elevenVoiceId) { [audio] buffer in
+                audio.scheduleStream(buffer, onLeft: playOnLeft)
+            }
+        } catch {
+            let buffers = await localSynth.render(text, lang: lang, to: audio.playbackFormat, rate: speechRate)
+            await audio.play(buffers: buffers, onLeft: playOnLeft)
+        }
+    }
+
+    /// 从缓冲里切出一个完整句子;不够一句返回 nil
+    private static func takeSentence(_ buffer: inout String) -> String? {
+        let enders: Set<Character> = ["。", "!", "?", "!", "?", ".", ";", ";", "\n"]
+        if let idx = buffer.lastIndex(where: { enders.contains($0) }) {
+            let head = String(buffer[...idx]).trimmingCharacters(in: .whitespacesAndNewlines)
+            buffer = String(buffer[buffer.index(after: idx)...])
+            return head.count >= 2 ? head : nil
+        }
+        if buffer.count > 90 {
+            let head = buffer
+            buffer = ""
+            return head
+        }
+        return nil
     }
 }
