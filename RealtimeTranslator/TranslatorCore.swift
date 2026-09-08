@@ -10,7 +10,8 @@ import AVFoundation
 ///   -> AVSpeechSynthesizer 合成 -> 对应声道播放
 ///
 /// 云端(v2,低延迟高质量):
-///   麦克风 -> VAD 断句(顺带判说话人性别) -> 双路 Deepgram 流式识别判语种
+///   麦克风 -> VAD 断句(顺带判说话人性别)
+///   -> 流式识别(Scribe v2 单路自动判语种,或双路 Deepgram)
 ///   -> Claude 流式翻译(带上下文) -> 按句切分 -> ElevenLabs 流式合成(性别匹配)
 ///   -> 音频块边到边播;翻译与合成并行,首句按逗号就开播
 @MainActor
@@ -22,6 +23,12 @@ final class TranslatorCore: ObservableObject {
     enum Engine: String, CaseIterable {
         case onDevice
         case cloud
+    }
+
+    /// 云端识别用哪家
+    enum ASRProvider: String, CaseIterable {
+        case scribe
+        case deepgram
     }
 
     /// 译文用什么声音:跟随说话人性别 / 固定男声 / 固定女声
@@ -46,6 +53,13 @@ final class TranslatorCore: ObservableObject {
     // 引擎选择与云端凭据(Key 存钥匙串)
     @Published var engine: Engine = Engine(rawValue: UserDefaults.standard.string(forKey: "engine") ?? "") ?? .onDevice {
         didSet { UserDefaults.standard.set(engine.rawValue, forKey: "engine") }
+    }
+    @Published var asrProvider: ASRProvider = ASRProvider(rawValue: UserDefaults.standard.string(forKey: "asrProvider") ?? "") ?? .scribe {
+        didSet { UserDefaults.standard.set(asrProvider.rawValue, forKey: "asrProvider") }
+    }
+    /// Scribe 关键词提示,逗号分隔,常被听错的词放这里
+    @Published var scribeKeyterms: String = UserDefaults.standard.string(forKey: "scribeKeyterms") ?? "" {
+        didSet { UserDefaults.standard.set(scribeKeyterms, forKey: "scribeKeyterms") }
     }
     @Published var deepgramKey: String = KeychainStore.get("deepgramKey") {
         didSet { KeychainStore.set(deepgramKey, for: "deepgramKey") }
@@ -76,7 +90,8 @@ final class TranslatorCore: ObservableObject {
     private let detector = UtteranceDetector()
     private let localRecognizer = DualRecognizer()
     private let localSynth = SpeechSynth()
-    private let cloudASR = DualDeepgramASR()
+    private let deepgramASR = DualDeepgramASR()
+    private let scribeASR = ScribeASR()
     private let cloudTranslator = ClaudeTranslator()
     private let cloudTTS = ElevenLabsTTS()
     private var bag = Set<AnyCancellable>()
@@ -110,8 +125,12 @@ final class TranslatorCore: ObservableObject {
                     return
                 }
             } else {
-                guard !deepgramKey.isEmpty, !anthropicKey.isEmpty, !elevenKey.isEmpty else {
-                    errorMessage = "云端模式需要先在设置里填入 Deepgram / Anthropic / ElevenLabs 三个 API Key"
+                guard !anthropicKey.isEmpty, !elevenKey.isEmpty else {
+                    errorMessage = "云端模式需要先在设置里填入 Anthropic 和 ElevenLabs 的 API Key"
+                    return
+                }
+                if asrProvider == .deepgram && deepgramKey.isEmpty {
+                    errorMessage = "选择 Deepgram 识别需要填入 Deepgram API Key,或切换到 Scribe"
                     return
                 }
             }
@@ -131,7 +150,8 @@ final class TranslatorCore: ObservableObject {
     func stop() {
         audio.stop()
         localRecognizer.cancel()
-        cloudASR.disconnect()
+        deepgramASR.disconnect()
+        scribeASR.disconnect()
         cloudTranslator.reset()
         detector.reset()
         running = false
@@ -228,18 +248,35 @@ final class TranslatorCore: ObservableObject {
 
     // MARK: - 云端管线(v2)
 
+    private var keytermList: [String] {
+        scribeKeyterms
+            .split(whereSeparator: { $0 == "," || $0 == "," || $0 == "\n" || $0 == "、" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
     private func wireCloud() {
-        cloudASR.onPartial = { [weak self] text in
+        let partialHandler: (String) -> Void = { [weak self] text in
             Task { @MainActor in self?.partialText = text }
         }
-        cloudASR.onError = { [weak self] message in
+        let errorHandler: (String) -> Void = { [weak self] message in
             Task { @MainActor in self?.errorMessage = message }
         }
-        cloudASR.connect(apiKey: deepgramKey)
 
         detector.threshold = vadThreshold
-        detector.onStart = { [cloudASR] in cloudASR.beginUtterance() }
-        detector.forward = { [cloudASR] buffer in cloudASR.append(buffer) }
+        if asrProvider == .scribe {
+            scribeASR.onPartial = partialHandler
+            scribeASR.onError = errorHandler
+            scribeASR.connect(apiKey: elevenKey, keyterms: keytermList)
+            detector.onStart = { [scribeASR] in scribeASR.beginUtterance() }
+            detector.forward = { [scribeASR] buffer in scribeASR.append(buffer) }
+        } else {
+            deepgramASR.onPartial = partialHandler
+            deepgramASR.onError = errorHandler
+            deepgramASR.connect(apiKey: deepgramKey)
+            detector.onStart = { [deepgramASR] in deepgramASR.beginUtterance() }
+            detector.forward = { [deepgramASR] buffer in deepgramASR.append(buffer) }
+        }
         detector.onEnd = { [weak self] in
             Task { @MainActor in await self?.finishCloudUtterance() }
         }
@@ -257,7 +294,22 @@ final class TranslatorCore: ObservableObject {
         // 先把这句的性别判断取出来(识别期间就算好了,不额外花时间)
         let detected = detector.takeGender()
 
-        guard let utterance = await cloudASR.endUtterance() else {
+        let recognized: (text: String, lang: Lang)?
+        if asrProvider == .scribe {
+            if let u = await scribeASR.endUtterance() {
+                recognized = (u.text, u.lang)
+            } else {
+                recognized = nil
+            }
+        } else {
+            if let u = await deepgramASR.endUtterance() {
+                recognized = (u.text, u.lang)
+            } else {
+                recognized = nil
+            }
+        }
+
+        guard let utterance = recognized else {
             partialText = ""
             return
         }
