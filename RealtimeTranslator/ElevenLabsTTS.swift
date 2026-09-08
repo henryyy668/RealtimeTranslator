@@ -2,11 +2,18 @@ import Foundation
 import AVFoundation
 
 /// ElevenLabs 流式合成:HTTP 分块返回原始 PCM(24k s16le 单声道),
-/// 一边接收一边转成 Float32 缓冲交给播放器,首块音频到达即可开播,
-/// 不需要等整句合成完。
+/// 一边接收一边转成 Float32 缓冲交给播放器,首块音频到达即可开播。
 final class ElevenLabsTTS {
     /// 与 AudioManager.playbackFormat 保持一致
     private let format = AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1)!
+
+    /// 复用连接,省掉每句话的 TLS 握手
+    private let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.httpMaximumConnectionsPerHost = 4
+        config.timeoutIntervalForRequest = 20
+        return URLSession(configuration: config)
+    }()
 
     func stream(
         text: String,
@@ -15,28 +22,28 @@ final class ElevenLabsTTS {
         onChunk: @escaping (AVAudioPCMBuffer) -> Void
     ) async throws {
         var request = URLRequest(url: URL(string:
-            "https://api.elevenlabs.io/v1/text-to-speech/\(voiceId)/stream?output_format=pcm_24000")!)
+            "https://api.elevenlabs.io/v1/text-to-speech/\(voiceId)/stream?output_format=pcm_24000&optimize_streaming_latency=4")!)
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: [
             "text": text,
-            "model_id": "eleven_flash_v2_5", // 低延迟多语种模型,中英都支持
+            "model_id": "eleven_flash_v2_5",
         ])
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        let (bytes, response) = try await session.bytes(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             throw NSError(domain: "ElevenLabsTTS", code: http.statusCode, userInfo: [
                 NSLocalizedDescriptionKey: "ElevenLabs 返回 \(http.statusCode),检查 Key、Voice ID 和额度"
             ])
         }
 
-        // 每攒约 0.2 秒音频出一个缓冲;跨块的奇数字节留到下一轮
+        // 每攒约 0.1 秒音频出一个缓冲,首声更快;跨块的奇数字节留到下一轮
         var raw = Data()
         raw.reserveCapacity(16_384)
         for try await byte in bytes {
             raw.append(byte)
-            if raw.count >= 9_600 {
+            if raw.count >= 4_800 {
                 emit(&raw, onChunk: onChunk)
             }
         }
