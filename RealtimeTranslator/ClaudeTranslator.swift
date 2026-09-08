@@ -11,11 +11,11 @@ final class ClaudeTranslator {
 
     private var history: [Exchange] = []
 
-    /// 一句翻完后登记进上下文,只保留最近 10 轮
+    /// 一句翻完后登记进上下文,只保留最近 6 轮(越短首 token 越快)
     func remember(source: String, target: String, lang: Lang) {
         history.append(Exchange(source: source, target: target, lang: lang))
-        if history.count > 10 {
-            history.removeFirst(history.count - 10)
+        if history.count > 6 {
+            history.removeFirst(history.count - 6)
         }
     }
 
@@ -72,17 +72,17 @@ final class ClaudeTranslator {
                     ? "中: \(exchange.source)\nEN: \(exchange.target)"
                     : "EN: \(exchange.source)\n中: \(exchange.target)"
             }
-            context = "对话上下文(仅供术语和人名保持一致,不要翻译这部分):\n"
-                + lines.joined(separator: "\n") + "\n\n"
+            context = "上下文(只用于术语人名一致,不要翻译):\n" + lines.joined(separator: "\n") + "\n\n"
         }
-        let direction = lang == .zh ? "把下面这句中文翻成英文" : "把下面这句英文翻成中文"
-        let prompt = context + direction + ",这是面对面口语对话,译文要自然口语化,只输出译文本身:\n\(text)"
+        let direction = lang == .zh ? "中译英" : "英译中"
+        let prompt = context + direction + ",口语对话,只输出译文:\n\(text)"
 
         let body: [String: Any] = [
             "model": "claude-haiku-4-5",
-            "max_tokens": 1024,
+            "max_tokens": 400,
+            "temperature": 0,
             "stream": true,
-            "system": "你是专业同声传译。只输出译文,不解释,不加引号,不加任何前后缀。人名、地名、专有名词与对话上下文保持一致。",
+            "system": "你是同声传译。只输出译文,不解释,不加引号,不加前后缀。人名地名专有名词与上下文一致。",
             "messages": [["role": "user", "content": prompt]],
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
