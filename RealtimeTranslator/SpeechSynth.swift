@@ -5,14 +5,15 @@ import AVFoundation
 final class SpeechSynth {
     private let synthesizer = AVSpeechSynthesizer()
 
-    /// 把一段文字合成为指定格式的 PCM 缓冲数组
+    /// 把一段文字合成为指定格式的 PCM 缓冲数组;gender 传 nil 用系统默认声音
     func render(
         _ text: String,
         lang: Lang,
         to format: AVAudioFormat,
-        rate: Float
+        rate: Float,
+        gender: SpeakerGender? = nil
     ) async -> [AVAudioPCMBuffer] {
-        guard let voice = AVSpeechSynthesisVoice(language: lang.speechLocale) else {
+        guard let voice = Self.pickVoice(locale: lang.speechLocale, gender: gender) else {
             return []
         }
         return await withCheckedContinuation { cont in
@@ -27,7 +28,6 @@ final class SpeechSynth {
             synthesizer.write(utterance) { buffer in
                 guard !finished else { return }
                 guard let pcm = buffer as? AVAudioPCMBuffer else { return }
-                // 零长度缓冲标志合成结束
                 if pcm.frameLength == 0 {
                     finished = true
                     cont.resume(returning: output)
@@ -41,6 +41,21 @@ final class SpeechSynth {
                 }
             }
         }
+    }
+
+    /// 按语言和性别挑系统声音,优先高质量档
+    private static func pickVoice(locale: String, gender: SpeakerGender?) -> AVSpeechSynthesisVoice? {
+        let candidates = AVSpeechSynthesisVoice.speechVoices().filter {
+            $0.language.lowercased() == locale.lowercased()
+        }
+        var pool = candidates
+        if let gender {
+            let wanted: AVSpeechSynthesisVoiceGender = gender == .male ? .male : .female
+            let matched = candidates.filter { $0.gender == wanted }
+            if !matched.isEmpty { pool = matched }
+        }
+        let sorted = pool.sorted { $0.quality.rawValue > $1.quality.rawValue }
+        return sorted.first ?? AVSpeechSynthesisVoice(language: locale)
     }
 
     private static func convert(
