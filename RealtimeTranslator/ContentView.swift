@@ -100,6 +100,12 @@ struct ContentView: View {
                         .truncationMode(.head)
                 }
                 Spacer()
+                if core.running, !core.outputName.isEmpty {
+                    Text("输出: \(core.outputName)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
             .padding(.horizontal)
             .padding(.vertical, 2)
@@ -175,13 +181,29 @@ struct ContentView: View {
                         SecureField("Deepgram API Key(识别)", text: $core.deepgramKey)
                         SecureField("Anthropic API Key(翻译)", text: $core.anthropicKey)
                         SecureField("ElevenLabs API Key(合成)", text: $core.elevenKey)
-                        TextField("ElevenLabs Voice ID", text: $core.elevenVoiceId)
-                            .autocorrectionDisabled()
-                            .textInputAutocapitalization(.never)
                         Text("Key 只保存在设备钥匙串,请求直连各服务商。三个平台注册都有免费额度。切换引擎会停止当前会话。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
+                }
+                Section("译文声音") {
+                    Picker("声音", selection: $core.voiceMode) {
+                        Text("跟随说话人").tag(TranslatorCore.VoiceMode.auto)
+                        Text("固定男声").tag(TranslatorCore.VoiceMode.male)
+                        Text("固定女声").tag(TranslatorCore.VoiceMode.female)
+                    }
+                    .pickerStyle(.segmented)
+                    if core.engine == .cloud {
+                        TextField("ElevenLabs 男声 Voice ID", text: $core.elevenVoiceMaleId)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                        TextField("ElevenLabs 女声 Voice ID", text: $core.elevenVoiceId)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                    }
+                    Text("「跟随说话人」会根据说话人的声音高低自动判断男女,男声说的话用男声播译文,女声用女声。判断不准时可以固定。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
                 Section("声道分配") {
                     Toggle("中文译文送到左耳", isOn: $core.zhOnLeft)
@@ -191,7 +213,7 @@ struct ContentView: View {
                 }
                 Section("播报") {
                     VStack(alignment: .leading) {
-                        Text("语速")
+                        Text("语速(端上引擎和兜底语音)")
                         Slider(value: $core.speechRate, in: 0.35...0.6)
                     }
                 }
