@@ -43,8 +43,6 @@ struct ContentView: View {
 
     // MARK: - 对话面板
 
-    /// 每个面板用对应语言渲染整段对话:
-    /// 自己说的显示原文(浅色),对方说的显示译文(深色加粗)
     private func pane(_ lang: Lang) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -178,12 +176,30 @@ struct ContentView: View {
                     }
                     .pickerStyle(.segmented)
                     if core.engine == .cloud {
-                        SecureField("Deepgram API Key(识别)", text: $core.deepgramKey)
                         SecureField("Anthropic API Key(翻译)", text: $core.anthropicKey)
-                        SecureField("ElevenLabs API Key(合成)", text: $core.elevenKey)
-                        Text("Key 只保存在设备钥匙串,请求直连各服务商。三个平台注册都有免费额度。切换引擎会停止当前会话。")
+                        SecureField("ElevenLabs API Key(识别 + 合成)", text: $core.elevenKey)
+                        Text("Key 只保存在设备钥匙串,请求直连各服务商。切换引擎会停止当前会话。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
+                    }
+                }
+                if core.engine == .cloud {
+                    Section("语音识别") {
+                        Picker("识别引擎", selection: $core.asrProvider) {
+                            Text("Scribe v2(ElevenLabs)").tag(TranslatorCore.ASRProvider.scribe)
+                            Text("Deepgram nova-3").tag(TranslatorCore.ASRProvider.deepgram)
+                        }
+                        .pickerStyle(.segmented)
+                        if core.asrProvider == .deepgram {
+                            SecureField("Deepgram API Key", text: $core.deepgramKey)
+                        } else {
+                            TextField("常被听错的词,逗号分隔(可选)", text: $core.scribeKeyterms, axis: .vertical)
+                                .lineLimit(1...4)
+                                .autocorrectionDisabled()
+                            Text("Scribe 单路同时听中英文,自动判语种。填入人名、地名、常用词能明显减少错字,最多 50 个。")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
                 Section("译文声音") {
@@ -225,6 +241,9 @@ struct ContentView: View {
                 }
             }
             .onChange(of: core.engine) {
+                if core.running { core.stop() }
+            }
+            .onChange(of: core.asrProvider) {
                 if core.running { core.stop() }
             }
             .navigationTitle("设置")
