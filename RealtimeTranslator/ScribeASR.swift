@@ -6,6 +6,7 @@ import AVFoundation
 /// 和双路 Deepgram 的区别:一条连接同时听中英文,模型自带语种识别,
 /// 不再靠两路置信度猜。音频全程持续上送(静默期送静音帧保持会话),
 /// 句尾由 App 的 VAD 决定,发 commit 拿本句终稿;弱网下终稿超时就用最后一条中间结果顶上。
+/// 连接尚未就绪时的音频先在本地排队,session_started 后补发,首句不丢字。
 final class ScribeASR {
     struct Utterance {
         let text: String
@@ -23,6 +24,13 @@ final class ScribeASR {
     private let downsampler = MicDownsampler()
     private var idleTimer: Timer?
     private var lastAudioSent = Date.distantPast
+
+    /// 连接是否已收到 session_started
+    private var ready = false
+    /// 就绪前排队的消息(音频 + 是否 commit),最多约 8 秒
+    private var pending: [(Data, Bool)] = []
+    private let pendingLimit = 100
+    private let queue = DispatchQueue(label: "scribe.send")
 
     private var awaitingCommit = false
     private var committedText: String?
@@ -43,7 +51,7 @@ final class ScribeASR {
         // 静默期每 100 毫秒补一帧静音,保持会话连续,也让模型有足够上下文
         idleTimer?.invalidate()
         idleTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            guard let self, self.active, self.socket != nil else { return }
+            guard let self, self.active, self.socket != nil, self.ready else { return }
             if Date().timeIntervalSince(self.lastAudioSent) > 0.15 {
                 self.send(audio: Self.silenceChunk, commit: false)
             }
@@ -51,6 +59,7 @@ final class ScribeASR {
     }
 
     private func open() {
+        ready = false
         var components = URLComponents(string: "wss://api.elevenlabs.io/v1/speech-to-text/realtime")!
         var items: [URLQueryItem] = [
             .init(name: "model_id", value: "scribe_v2_realtime"),
@@ -79,6 +88,8 @@ final class ScribeASR {
         idleTimer = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
+        ready = false
+        queue.sync { pending.removeAll() }
         awaitingCommit = false
         committedText = nil
         committedLang = nil
@@ -90,6 +101,9 @@ final class ScribeASR {
         committedText = nil
         committedLang = nil
         lastPartial = ""
+        if socket == nil, active, !fatal {
+            open()
+        }
     }
 
     /// 音频线程:降采样到 16k s16le 后上送
@@ -139,7 +153,20 @@ final class ScribeASR {
         return han > 0 ? .zh : .en
     }
 
+    /// 未就绪时排队,就绪后直发
     private func send(audio: Data, commit: Bool) {
+        queue.sync {
+            if !ready {
+                if pending.count < pendingLimit {
+                    pending.append((audio, commit))
+                }
+                return
+            }
+            sendNow(audio: audio, commit: commit)
+        }
+    }
+
+    private func sendNow(audio: Data, commit: Bool) {
         guard let socket else { return }
         var message: [String: Any] = [
             "message_type": "input_audio_chunk",
@@ -152,6 +179,18 @@ final class ScribeASR {
               let text = String(data: data, encoding: .utf8) else { return }
         lastAudioSent = Date()
         socket.send(.string(text)) { _ in }
+    }
+
+    /// 连接就绪:把排队的音频按顺序补发
+    private func flushPending() {
+        queue.sync {
+            ready = true
+            let items = pending
+            pending.removeAll()
+            for (audio, commit) in items {
+                sendNow(audio: audio, commit: commit)
+            }
+        }
     }
 
     private func receiveLoop(_ task: URLSessionWebSocketTask) {
@@ -179,6 +218,7 @@ final class ScribeASR {
 
     private func scheduleReconnect() {
         socket = nil
+        ready = false
         guard active, !fatal else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, self.active, !self.fatal, self.socket == nil else { return }
@@ -192,7 +232,9 @@ final class ScribeASR {
               let type = obj["message_type"] as? String else { return }
 
         switch type {
-        case "session_started", "warning", "committed_transcript_entities":
+        case "session_started":
+            flushPending()
+        case "warning", "committed_transcript_entities":
             break
         case "partial_transcript":
             let text = ((obj["text"] as? String) ?? "").trimmingCharacters(in: .whitespaces)
