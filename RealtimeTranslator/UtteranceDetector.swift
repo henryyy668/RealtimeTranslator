@@ -6,24 +6,34 @@ enum SpeakerGender: String {
     case female
 }
 
-/// 基于能量的语音活动检测(VAD),并在说话期间顺带估算基频用于判断说话人性别。
+/// 基于能量的语音活动检测(VAD),阈值随环境底噪自适应,
+/// 并在说话期间顺带估算基频用于判断说话人性别。
 ///
-/// 状态机:静音 -> 检测到音量超过阈值 -> 触发 onStart 并开始转发缓冲 ->
-/// 持续静音超过 hangTime -> 触发 onEnd 并自动暂停(半双工),
+/// 状态机:静音 -> 检测到音量超过触发线 -> 触发 onStart 并开始转发缓冲 ->
+/// 持续静音超过 hangTime(或说话超过 maxUtterance)-> 触发 onEnd 并自动暂停(半双工),
 /// 等流水线(翻译 + 播报)处理完后由外部调用 resume() 恢复。
+///
+/// 触发线 = max(用户设定的最低阈值, 环境底噪 x 3)。安静房间按滑块走,
+/// 车里、街上底噪高时触发线自动抬高,不会把噪音当成说话。
 final class UtteranceDetector {
-    /// 触发阈值(RMS),环境越吵需要越高
+    /// 用户设定的最低触发阈值(RMS),来自设置里的灵敏度滑块
     var threshold: Float = 0.015
-    /// 尾部静音多久算一句话结束(越短反应越快,太短会把一句话切成两半)
+    /// 尾部静音多久算一句话结束
     var hangTime: TimeInterval = 0.55
+    /// 一句话最长多少秒,超过强制切断送翻,避免嘈杂环境下永远等不到句尾
+    var maxUtterance: TimeInterval = 20
     /// 说话前保留几个缓冲,避免吃掉第一个音节
     private let prerollCount = 4
 
     private var speaking = false
     private var enabled = true
     private var lastVoice = Date.distantPast
+    private var speechStart = Date.distantPast
     private var preroll: [AVAudioPCMBuffer] = []
     private var pitches: [Float] = []
+
+    /// 环境底噪估计(RMS),只在没人说话时更新
+    private var noiseFloor: Float = 0.003
 
     /// 一句话开始(音频线程同步调用,先于第一个 forward)
     var onStart: (() -> Void)?
@@ -32,19 +42,27 @@ final class UtteranceDetector {
     /// 转发属于本句的音频缓冲
     var forward: ((AVAudioPCMBuffer) -> Void)?
 
+    /// 当前实际使用的触发线
+    var effectiveThreshold: Float {
+        max(threshold, noiseFloor * 3)
+    }
+
     func feed(_ buffer: AVAudioPCMBuffer) {
         guard enabled else { return }
         let level = Self.rms(buffer)
         let now = Date()
 
         if !speaking {
+            updateNoiseFloor(level)
+
             preroll.append(buffer)
             if preroll.count > prerollCount {
                 preroll.removeFirst()
             }
-            if level > threshold {
+            if level > effectiveThreshold {
                 speaking = true
                 lastVoice = now
+                speechStart = now
                 pitches.removeAll()
                 onStart?()
                 for pending in preroll {
@@ -57,14 +75,29 @@ final class UtteranceDetector {
         }
 
         forward?(buffer)
-        if level > threshold {
+        if level > effectiveThreshold {
             lastVoice = now
             if let f = Self.pitch(buffer) { pitches.append(f) }
-        } else if now.timeIntervalSince(lastVoice) > hangTime {
+        }
+
+        let silentLongEnough = now.timeIntervalSince(lastVoice) > hangTime
+        let tooLong = now.timeIntervalSince(speechStart) > maxUtterance
+        if silentLongEnough || tooLong {
             speaking = false
             enabled = false // 半双工:先处理完这句再继续听
             onEnd?()
         }
+    }
+
+    /// 底噪估计:往下跟得快(环境突然安静立刻生效),往上跟得慢(几秒内适应新的噪音水平),
+    /// 并且不会跟到说话的音量上去(有上限)
+    private func updateNoiseFloor(_ level: Float) {
+        if level < noiseFloor {
+            noiseFloor = noiseFloor * 0.7 + level * 0.3
+        } else if level < noiseFloor * 4 {
+            noiseFloor = noiseFloor * 0.97 + level * 0.03
+        }
+        noiseFloor = min(max(noiseFloor, 0.001), 0.15)
     }
 
     /// 取出本句说话人的性别判断(基频中位数),数据不足或处于模糊区间返回 nil
@@ -90,6 +123,7 @@ final class UtteranceDetector {
         pitches.removeAll()
         speaking = false
         enabled = true
+        noiseFloor = 0.003
     }
 
     private static func rms(_ buffer: AVAudioPCMBuffer) -> Float {
@@ -150,7 +184,6 @@ final class UtteranceDetector {
                 bestLag = lag
             }
         }
-        // 相关性不够强说明不是清晰的有声段(比如气音、噪声),不计入
         guard best > 0.45, bestLag > 0 else { return nil }
         return fs / Float(bestLag)
     }
