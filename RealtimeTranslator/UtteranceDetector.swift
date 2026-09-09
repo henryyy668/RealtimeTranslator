@@ -9,19 +9,20 @@ enum SpeakerGender: String {
 /// 基于能量的语音活动检测(VAD),阈值随环境底噪自适应,
 /// 并在说话期间顺带估算基频用于判断说话人性别。
 ///
-/// 状态机:静音 -> 检测到音量超过触发线 -> 触发 onStart 并开始转发缓冲 ->
-/// 持续静音超过 hangTime(或说话超过 maxUtterance)-> 触发 onEnd 并自动暂停(半双工),
-/// 等流水线(翻译 + 播报)处理完后由外部调用 resume() 恢复。
+/// 状态机:启动后先校准 1 秒底噪(只听不判)-> 静音 -> 音量超过触发线 -> onStart 并转发缓冲 ->
+/// 持续静音超过 hangTime(或说话超过 maxUtterance)-> onEnd 并自动暂停(半双工),
+/// 等流水线处理完后由外部调用 resume() 恢复。
 ///
-/// 触发线 = max(用户设定的最低阈值, 环境底噪 x 3)。安静房间按滑块走,
-/// 车里、街上底噪高时触发线自动抬高,不会把噪音当成说话。
+/// 触发线 = max(用户设定的最低阈值, 环境底噪 x 3)。
 final class UtteranceDetector {
     /// 用户设定的最低触发阈值(RMS),来自设置里的灵敏度滑块
     var threshold: Float = 0.015
     /// 尾部静音多久算一句话结束
     var hangTime: TimeInterval = 0.55
-    /// 一句话最长多少秒,超过强制切断送翻,避免嘈杂环境下永远等不到句尾
+    /// 一句话最长多少秒,超过强制切断送翻
     var maxUtterance: TimeInterval = 20
+    /// 启动后先校准底噪多久(期间不触发)
+    var warmupTime: TimeInterval = 1.0
     /// 说话前保留几个缓冲,避免吃掉第一个音节
     private let prerollCount = 4
 
@@ -29,11 +30,13 @@ final class UtteranceDetector {
     private var enabled = true
     private var lastVoice = Date.distantPast
     private var speechStart = Date.distantPast
+    private var warmupUntil = Date.distantPast
     private var preroll: [AVAudioPCMBuffer] = []
     private var pitches: [Float] = []
 
     /// 环境底噪估计(RMS),只在没人说话时更新
     private var noiseFloor: Float = 0.003
+    private var calibrated = false
 
     /// 一句话开始(音频线程同步调用,先于第一个 forward)
     var onStart: (() -> Void)?
@@ -51,6 +54,18 @@ final class UtteranceDetector {
         guard enabled else { return }
         let level = Self.rms(buffer)
         let now = Date()
+
+        // 校准期:只测底噪,不触发。第一帧直接采纳为初值,后面平滑
+        if now < warmupUntil {
+            if calibrated {
+                noiseFloor = noiseFloor * 0.8 + level * 0.2
+            } else {
+                noiseFloor = level
+                calibrated = true
+            }
+            noiseFloor = min(max(noiseFloor, 0.001), 0.15)
+            return
+        }
 
         if !speaking {
             updateNoiseFloor(level)
@@ -89,8 +104,7 @@ final class UtteranceDetector {
         }
     }
 
-    /// 底噪估计:往下跟得快(环境突然安静立刻生效),往上跟得慢(几秒内适应新的噪音水平),
-    /// 并且不会跟到说话的音量上去(有上限)
+    /// 底噪估计:往下跟得快,往上跟得慢,不会跟到说话的音量上去
     private func updateNoiseFloor(_ level: Float) {
         if level < noiseFloor {
             noiseFloor = noiseFloor * 0.7 + level * 0.3
@@ -118,12 +132,15 @@ final class UtteranceDetector {
         enabled = true
     }
 
+    /// 会话开始时调用:清状态并进入 1 秒底噪校准
     func reset() {
         preroll.removeAll()
         pitches.removeAll()
         speaking = false
         enabled = true
+        calibrated = false
         noiseFloor = 0.003
+        warmupUntil = Date().addingTimeInterval(warmupTime)
     }
 
     private static func rms(_ buffer: AVAudioPCMBuffer) -> Float {
