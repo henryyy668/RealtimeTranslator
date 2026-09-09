@@ -6,6 +6,9 @@ import AVFoundation
 /// 你戴左耳、朋友戴右耳,中文译文只 pan 到左声道、英文译文只 pan 到右声道,
 /// 两人各听各的互不干扰。收音始终用 iPhone 自带麦克风,
 /// 这样耳机保持 A2DP 高音质输出,不会因为蓝牙上行掉到 HFP 低音质。
+///
+/// 外放(手机喇叭 / 车机)时自动打开系统语音处理:回声消除 + 噪音抑制 + 自动增益,
+/// 车里、街上也能稳定断句。连着耳机时不开,以保住耳机音质。
 final class AudioManager {
     let engine = AVAudioEngine()
     private let playerLeft = AVAudioPlayerNode()
@@ -19,8 +22,11 @@ final class AudioManager {
     /// 每个麦克风缓冲的回调(音频线程调用)
     var onBuffer: ((AVAudioPCMBuffer) -> Void)?
 
-    /// 当前输出设备名称变化时回调(主线程),可选,用来在界面上显示"输出: AirPods"
+    /// 当前输出设备名称变化时回调(主线程),用来在界面上显示"输出: AirPods"
     var onRouteChange: ((String) -> Void)?
+
+    /// 当前是否开着系统语音处理(降噪)
+    private(set) var voiceProcessingOn = false
 
     /// 当前输出设备的可读名称
     var currentOutputName: String {
@@ -28,7 +34,7 @@ final class AudioManager {
         guard let first = outs.first else { return "无" }
         switch first.portType {
         case .bluetoothA2DP, .bluetoothLE, .bluetoothHFP: return first.portName
-        case .builtInSpeaker: return "扬声器"
+        case .builtInSpeaker: return voiceProcessingOn ? "扬声器·降噪" : "扬声器"
         case .builtInReceiver: return "听筒"
         case .headphones: return "有线耳机"
         default: return first.portName
@@ -128,6 +134,23 @@ final class AudioManager {
     }
 
     func start() throws {
+        let input = engine.inputNode
+
+        // 外放时开语音处理(降噪 / 回声消除 / 自动增益),耳机时关。
+        // 必须在引擎启动前设置,所以按启动那一刻的路由决定。
+        let wantVP = !hasBluetoothOutput
+        if input.isVoiceProcessingEnabled != wantVP {
+            do {
+                try input.setVoiceProcessingEnabled(wantVP)
+                voiceProcessingOn = wantVP
+            } catch {
+                print("语音处理切换失败: \(error)")
+                voiceProcessingOn = input.isVoiceProcessingEnabled
+            }
+        } else {
+            voiceProcessingOn = wantVP
+        }
+
         if !graphBuilt {
             engine.attach(playerLeft)
             engine.attach(playerRight)
@@ -138,7 +161,6 @@ final class AudioManager {
             graphBuilt = true
         }
 
-        let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
