@@ -2,13 +2,13 @@ import AVFoundation
 
 /// 音频中枢:负责音频会话配置、麦克风采集、以及把两路译文分别送进左右声道。
 ///
-/// 核心思路:一副耳机(如 AirPods)对系统来说是一个立体声输出设备,
-/// 你戴左耳、朋友戴右耳,中文译文只 pan 到左声道、英文译文只 pan 到右声道,
-/// 两人各听各的互不干扰。收音始终用 iPhone 自带麦克风,
-/// 这样耳机保持 A2DP 高音质输出,不会因为蓝牙上行掉到 HFP 低音质。
+/// 一副耳机(如 AirPods)对系统来说是一个立体声输出设备,
+/// 你戴左耳、朋友戴右耳,中文译文只 pan 到左声道、英文译文只 pan 到右声道。
+/// 收音始终用 iPhone 自带麦克风,耳机保持 A2DP 高音质输出。
 ///
-/// 外放(手机喇叭 / 车机)时自动打开系统语音处理:回声消除 + 噪音抑制 + 自动增益,
-/// 车里、街上也能稳定断句。连着耳机时不开,以保住耳机音质。
+/// 外放(手机喇叭 / 车机)时自动打开系统语音处理(回声消除 + 噪音抑制 + 自动增益)。
+/// 语音处理首次启用会触发一次引擎重配置,所以启动时先预热一遍,
+/// 并且所有"等播完"的地方都带超时,任何情况下流水线不会卡死。
 final class AudioManager {
     let engine = AVAudioEngine()
     private let playerLeft = AVAudioPlayerNode()
@@ -22,13 +22,12 @@ final class AudioManager {
     /// 每个麦克风缓冲的回调(音频线程调用)
     var onBuffer: ((AVAudioPCMBuffer) -> Void)?
 
-    /// 当前输出设备名称变化时回调(主线程),用来在界面上显示"输出: AirPods"
+    /// 当前输出设备名称变化时回调(主线程)
     var onRouteChange: ((String) -> Void)?
 
     /// 当前是否开着系统语音处理(降噪)
     private(set) var voiceProcessingOn = false
 
-    /// 当前输出设备的可读名称
     var currentOutputName: String {
         let outs = AVAudioSession.sharedInstance().currentRoute.outputs
         guard let first = outs.first else { return "无" }
@@ -49,8 +48,6 @@ final class AudioManager {
 
     func configureSession() throws {
         let session = AVAudioSession.sharedInstance()
-        // 只允许 A2DP 蓝牙输出保证耳机音质;不用 voiceChat 和 defaultToSpeaker,
-        // 否则 iOS 会把输出强制按在手机喇叭上,耳机没声。
         try session.setCategory(
             .playAndRecord,
             mode: .default,
@@ -58,7 +55,6 @@ final class AudioManager {
         )
         try session.setActive(true)
 
-        // 强制用 iPhone 自带麦克风收音,耳机只做输出
         if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
             try? session.setPreferredInput(builtIn)
         }
@@ -68,7 +64,6 @@ final class AudioManager {
         notifyRoute()
     }
 
-    /// 有蓝牙就把输出交还给系统(走耳机),没蓝牙才强制外放
     private func applyOutputOverride() {
         let session = AVAudioSession.sharedInstance()
         if hasBluetoothOutput {
@@ -82,7 +77,6 @@ final class AudioManager {
         guard observers.isEmpty else { return }
         let center = NotificationCenter.default
 
-        // 耳机连上、断开、系统切换输出
         observers.append(center.addObserver(
             forName: AVAudioSession.routeChangeNotification,
             object: nil, queue: .main
@@ -93,7 +87,6 @@ final class AudioManager {
             self.notifyRoute()
         })
 
-        // 引擎因为硬件格式变化自动停了,必须重启,否则后面的音频全部静默
         observers.append(center.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: engine, queue: .main
@@ -101,7 +94,6 @@ final class AudioManager {
             self?.restartEngineIfNeeded()
         })
 
-        // 来电、Siri 等打断结束后恢复
         observers.append(center.addObserver(
             forName: AVAudioSession.interruptionNotification,
             object: nil, queue: .main
@@ -136,13 +128,14 @@ final class AudioManager {
     func start() throws {
         let input = engine.inputNode
 
-        // 外放时开语音处理(降噪 / 回声消除 / 自动增益),耳机时关。
-        // 必须在引擎启动前设置,所以按启动那一刻的路由决定。
+        // 外放时开语音处理,耳机时关。必须在引擎启动前设置。
         let wantVP = !hasBluetoothOutput
+        var vpToggled = false
         if input.isVoiceProcessingEnabled != wantVP {
             do {
                 try input.setVoiceProcessingEnabled(wantVP)
                 voiceProcessingOn = wantVP
+                vpToggled = true
             } catch {
                 print("语音处理切换失败: \(error)")
                 voiceProcessingOn = input.isVoiceProcessingEnabled
@@ -156,9 +149,20 @@ final class AudioManager {
             engine.attach(playerRight)
             engine.connect(playerLeft, to: engine.mainMixerNode, format: playbackFormat)
             engine.connect(playerRight, to: engine.mainMixerNode, format: playbackFormat)
-            playerLeft.pan = -1.0   // 完全左声道
-            playerRight.pan = 1.0   // 完全右声道
+            playerLeft.pan = -1.0
+            playerRight.pan = 1.0
             graphBuilt = true
+        }
+
+        applyOutputOverride()
+
+        // 语音处理刚切换过:先空跑一次让硬件格式稳定下来,
+        // 把"引擎重配置"消化在启动阶段,而不是在第一句播报时
+        if vpToggled {
+            engine.prepare()
+            try engine.start()
+            Thread.sleep(forTimeInterval: 0.25)
+            engine.stop()
         }
 
         let format = input.outputFormat(forBus: 0)
@@ -167,7 +171,6 @@ final class AudioManager {
             self?.onBuffer?(buffer)
         }
 
-        applyOutputOverride()
         engine.prepare()
         try engine.start()
         playerLeft.play()
@@ -182,17 +185,16 @@ final class AudioManager {
         engine.stop()
     }
 
-    /// 把一段 TTS 缓冲调度到指定声道播放,播放完成后才返回
+    /// 把一段 TTS 缓冲调度到指定声道播放,播放完成后返回;超时也返回,绝不卡死
     func play(buffers: [AVAudioPCMBuffer], onLeft: Bool) async {
         guard !buffers.isEmpty else { return }
         restartEngineIfNeeded()
         let player = onLeft ? playerLeft : playerRight
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+        let seconds = buffers.reduce(0.0) { $0 + Double($1.frameLength) / $1.format.sampleRate }
+        await waitPlayback(timeout: seconds + 3) { done in
             for (index, buffer) in buffers.enumerated() {
                 if index == buffers.count - 1 {
-                    player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { _ in
-                        cont.resume()
-                    }
+                    player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { _ in done() }
                 } else {
                     player.scheduleBuffer(buffer)
                 }
@@ -208,7 +210,7 @@ final class AudioManager {
         (onLeft ? playerLeft : playerRight).scheduleBuffer(buffer)
     }
 
-    /// 等待某个声道队列里的音频全部播完:队尾排一小段静音,它播完即全部播完
+    /// 等待某个声道队列里的音频全部播完:队尾排一小段静音,它播完即全部播完;最多等 12 秒
     func finishStream(onLeft: Bool) async {
         restartEngineIfNeeded()
         guard let tail = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: 240) else { return }
@@ -217,10 +219,38 @@ final class AudioManager {
             memset(channel[0], 0, Int(tail.frameLength) * MemoryLayout<Float>.size)
         }
         let player = onLeft ? playerLeft : playerRight
+        await waitPlayback(timeout: 12) { done in
+            player.scheduleBuffer(tail, completionCallbackType: .dataPlayedBack) { _ in done() }
+        }
+    }
+
+    /// 带超时的等待:schedule 里拿到的 done 回调播完时调用;超时未到也会返回。只会恢复一次。
+    private func waitPlayback(timeout: TimeInterval, schedule: (@escaping () -> Void) -> Void) async {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            player.scheduleBuffer(tail, completionCallbackType: .dataPlayedBack) { _ in
-                cont.resume()
+            let once = ResumeOnce(cont)
+            schedule { once.resume() }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                once.resume()
             }
         }
+    }
+}
+
+/// 保证 continuation 只被恢复一次(播完回调和超时谁先到谁算)
+private final class ResumeOnce {
+    private var resumed = false
+    private let lock = NSLock()
+    private let continuation: CheckedContinuation<Void, Never>
+
+    init(_ continuation: CheckedContinuation<Void, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !resumed else { return }
+        resumed = true
+        continuation.resume()
     }
 }
