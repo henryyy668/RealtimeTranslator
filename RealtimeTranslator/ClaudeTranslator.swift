@@ -75,14 +75,25 @@ final class ClaudeTranslator {
             context = "上下文(只用于术语人名一致,不要翻译):\n" + lines.joined(separator: "\n") + "\n\n"
         }
         let direction = lang == .zh ? "中译英" : "英译中"
-        let prompt = context + direction + ",口语对话,只输出译文:\n\(text)"
+        let prompt = context + direction + ",只输出译文:\n\(text)"
+
+        let system = """
+        你是面对面对话的同声传译。只输出译文,不解释,不加引号,不加前后缀。
+        规则:
+        1. 去掉口头语和填充词(呃、嗯、那个、就是、然后、uh、um、like、you know 等),不要翻译它们。
+        2. 说话人重复或改口的部分,只保留最后一次完整的表达,不要翻重复。
+        3. 语音识别造成的破碎片段和断句符号(——、……)不要保留,整理成通顺的一句话。
+        4. 保持原意和语气,不添加内容,不省略实质信息。口语对话,译文自然简短。
+        5. 人名、地名、专有名词与上下文保持一致。
+        6. 如果原文只有口头语没有实质内容,输出一个空格。
+        """
 
         let body: [String: Any] = [
             "model": "claude-haiku-4-5",
             "max_tokens": 400,
             "temperature": 0,
             "stream": true,
-            "system": "你是同声传译。只输出译文,不解释,不加引号,不加前后缀。人名地名专有名词与上下文一致。",
+            "system": system,
             "messages": [["role": "user", "content": prompt]],
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
