@@ -5,7 +5,7 @@ import AVFoundation
 ///
 /// 和双路 Deepgram 的区别:一条连接同时听中英文,模型自带语种识别,
 /// 不再靠两路置信度猜。音频全程持续上送(静默期送静音帧保持会话),
-/// 句尾由 App 的 VAD 决定,发 commit 拿本句终稿。
+/// 句尾由 App 的 VAD 决定,发 commit 拿本句终稿;弱网下终稿超时就用最后一条中间结果顶上。
 final class ScribeASR {
     struct Utterance {
         let text: String
@@ -27,6 +27,7 @@ final class ScribeASR {
     private var awaitingCommit = false
     private var committedText: String?
     private var committedLang: String?
+    private var lastPartial = ""
 
     /// 100 毫秒 16k s16le 静音
     private static let silenceChunk = Data(count: 3_200)
@@ -81,12 +82,14 @@ final class ScribeASR {
         awaitingCommit = false
         committedText = nil
         committedLang = nil
+        lastPartial = ""
     }
 
     /// 一句话开始(VAD 触发,音频线程调用)
     func beginUtterance() {
         committedText = nil
         committedLang = nil
+        lastPartial = ""
     }
 
     /// 音频线程:降采样到 16k s16le 后上送
@@ -95,7 +98,8 @@ final class ScribeASR {
         send(audio: data, commit: false)
     }
 
-    /// 句尾:发 commit,等本句终稿(最多 2.5 秒),语种信息稍后到再等 0.4 秒
+    /// 句尾:发 commit,等本句终稿(最多 5 秒,弱网留余量),语种信息稍后到再等 0.4 秒。
+    /// 终稿等不到就用最后一条中间结果,不丢句。
     func endUtterance() async -> Utterance? {
         guard socket != nil else { return nil }
         committedText = nil
@@ -103,7 +107,7 @@ final class ScribeASR {
         awaitingCommit = true
         send(audio: Self.silenceChunk, commit: true)
 
-        let deadline = Date().addingTimeInterval(2.5)
+        let deadline = Date().addingTimeInterval(5.0)
         while Date() < deadline, committedText == nil {
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
@@ -113,10 +117,11 @@ final class ScribeASR {
         }
         awaitingCommit = false
 
-        let text = (committedText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = (committedText ?? lastPartial).trimmingCharacters(in: .whitespacesAndNewlines)
         let code = committedLang
         committedText = nil
         committedLang = nil
+        lastPartial = ""
         guard !text.isEmpty else { return nil }
         return Utterance(text: text, lang: Self.decideLang(text: text, code: code))
     }
@@ -191,7 +196,10 @@ final class ScribeASR {
             break
         case "partial_transcript":
             let text = ((obj["text"] as? String) ?? "").trimmingCharacters(in: .whitespaces)
-            if !text.isEmpty { onPartial?(text) }
+            if !text.isEmpty {
+                lastPartial = text
+                onPartial?(text)
+            }
         case "committed_transcript":
             if awaitingCommit {
                 committedText = (obj["text"] as? String) ?? ""
