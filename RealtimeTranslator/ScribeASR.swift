@@ -7,6 +7,7 @@ import AVFoundation
 /// 句尾由 App 的 VAD 决定,发 commit 拿本句终稿;弱网下终稿超时就用最后一条中间结果顶上。
 /// 连接尚未就绪时的音频先在本地排队,session_started 后补发,首句不丢字。
 /// 与上一句完全相同的原文视为回声或重复终稿,直接丢弃。
+/// 终稿一到立刻放行,不等语种信息(语种由文字本身判断)。
 final class ScribeASR {
     struct Utterance {
         let text: String
@@ -114,7 +115,7 @@ final class ScribeASR {
         send(audio: data, commit: false)
     }
 
-    /// 句尾:发 commit,等本句终稿(最多 5 秒),语种信息稍后到再等 0.4 秒。
+    /// 句尾:发 commit,等本句终稿(最多 5 秒),到了立刻放行。
     /// 终稿等不到就用最后一条中间结果;和上一句相同的原文丢弃。
     func endUtterance() async -> Utterance? {
         guard socket != nil else { return nil }
@@ -125,11 +126,7 @@ final class ScribeASR {
 
         let deadline = Date().addingTimeInterval(5.0)
         while Date() < deadline, committedText == nil {
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-        let langDeadline = Date().addingTimeInterval(0.4)
-        while Date() < langDeadline, committedText != nil, committedLang == nil {
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
         awaitingCommit = false
 
