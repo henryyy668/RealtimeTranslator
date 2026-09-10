@@ -10,7 +10,6 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // 上半屏给对面的英文使用者看,面对面模式下旋转 180 度
             pane(.en)
                 .rotationEffect(faceToFace ? .degrees(180) : .degrees(0))
             centerBar
@@ -40,8 +39,6 @@ struct ContentView: View {
             settings
         }
     }
-
-    // MARK: - 对话面板
 
     private func pane(_ lang: Lang) -> some View {
         ScrollViewReader { proxy in
@@ -78,8 +75,6 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: mine ? .trailing : .leading)
             .id(entry.id)
     }
-
-    // MARK: - 中缝状态条
 
     private var centerBar: some View {
         VStack(spacing: 4) {
@@ -119,8 +114,6 @@ struct ContentView: View {
         case .playing: return "播报中"
         }
     }
-
-    // MARK: - 底部控制区
 
     private var controls: some View {
         VStack(spacing: 10) {
@@ -164,24 +157,36 @@ struct ContentView: View {
         .padding(.bottom, 12)
     }
 
-    // MARK: - 设置
-
     private var settings: some View {
         NavigationStack {
             Form {
                 Section("翻译引擎") {
                     Picker("引擎", selection: $core.engine) {
-                        Text("端上(离线免费)").tag(TranslatorCore.Engine.onDevice)
-                        Text("云端(低延迟)").tag(TranslatorCore.Engine.cloud)
+                        Text("端上").tag(TranslatorCore.Engine.onDevice)
+                        Text("云端").tag(TranslatorCore.Engine.cloud)
+                        Text("OpenAI 实时").tag(TranslatorCore.Engine.openai)
                     }
                     .pickerStyle(.segmented)
-                    if core.engine == .cloud {
+                    switch core.engine {
+                    case .onDevice:
+                        Text("苹果端上模型,离线免费,质量一般。首次使用先点「下载语言包」。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    case .cloud:
                         SecureField("Anthropic API Key(翻译)", text: $core.anthropicKey)
                         SecureField("ElevenLabs API Key(识别 + 合成)", text: $core.elevenKey)
-                        Text("Key 只保存在设备钥匙串,请求直连各服务商。切换引擎会停止当前会话。")
+                        Text("识别 + Claude 翻译 + ElevenLabs 真人声,质量最高,说完一句约 1.5 秒出声。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    case .openai:
+                        SecureField("OpenAI API Key", text: $core.openaiKey)
+                        Text("gpt-realtime-translate 端到端边听边译,话没说完译文就开始出,延迟最低。声音为 OpenAI 固定音色,不支持性别匹配和克隆。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
+                    Text("Key 只保存在设备钥匙串,请求直连各服务商。切换引擎会停止当前会话。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
                 if core.engine == .cloud {
                     Section("语音识别") {
@@ -196,20 +201,15 @@ struct ContentView: View {
                             TextField("常被听错的词,逗号分隔(可选)", text: $core.scribeKeyterms, axis: .vertical)
                                 .lineLimit(1...4)
                                 .autocorrectionDisabled()
-                            Text("Scribe 单路同时听中英文,自动判语种。填入人名、地名、常用词能明显减少错字,最多 50 个。")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
                         }
                     }
-                }
-                Section("译文声音") {
-                    Picker("声音", selection: $core.voiceMode) {
-                        Text("跟随说话人").tag(TranslatorCore.VoiceMode.auto)
-                        Text("固定男声").tag(TranslatorCore.VoiceMode.male)
-                        Text("固定女声").tag(TranslatorCore.VoiceMode.female)
-                    }
-                    .pickerStyle(.segmented)
-                    if core.engine == .cloud {
+                    Section("译文声音") {
+                        Picker("声音", selection: $core.voiceMode) {
+                            Text("跟随说话人").tag(TranslatorCore.VoiceMode.auto)
+                            Text("固定男声").tag(TranslatorCore.VoiceMode.male)
+                            Text("固定女声").tag(TranslatorCore.VoiceMode.female)
+                        }
+                        .pickerStyle(.segmented)
                         TextField("ElevenLabs 男声 Voice ID", text: $core.elevenVoiceMaleId)
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
@@ -217,26 +217,25 @@ struct ContentView: View {
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
                     }
-                    Text("「跟随说话人」会根据说话人的声音高低自动判断男女,男声说的话用男声播译文,女声用女声。判断不准时可以固定。")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
                 }
                 Section("声道分配") {
                     Toggle("中文译文送到左耳", isOn: $core.zhOnLeft)
-                    Text("两人各戴一只耳机。说中文的人戴接收中文译文的那只,说英文的朋友戴另一只。译文只送进对应的耳朵,互不干扰。")
+                    Text("两人各戴一只耳机。说中文的人戴接收中文译文的那只,说英文的朋友戴另一只。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                Section("播报") {
-                    VStack(alignment: .leading) {
-                        Text("语速(端上引擎和兜底语音)")
-                        Slider(value: $core.speechRate, in: 0.35...0.6)
+                if core.engine != .openai {
+                    Section("播报") {
+                        VStack(alignment: .leading) {
+                            Text("语速(端上引擎和兜底语音)")
+                            Slider(value: $core.speechRate, in: 0.35...0.6)
+                        }
                     }
-                }
-                Section("拾音") {
-                    VStack(alignment: .leading) {
-                        Text("触发灵敏度(环境吵就往右调)")
-                        Slider(value: $core.vadThreshold, in: 0.005...0.05)
+                    Section("拾音") {
+                        VStack(alignment: .leading) {
+                            Text("触发灵敏度(环境吵就往右调)")
+                            Slider(value: $core.vadThreshold, in: 0.005...0.05)
+                        }
                     }
                 }
             }
