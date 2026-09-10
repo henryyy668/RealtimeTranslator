@@ -17,8 +17,8 @@ enum SpeakerGender: String {
 final class UtteranceDetector {
     /// 用户设定的最低触发阈值(RMS),来自设置里的灵敏度滑块
     var threshold: Float = 0.015
-    /// 尾部静音多久算一句话结束
-    var hangTime: TimeInterval = 0.55
+    /// 尾部静音多久算一句话结束(0.45 是不把一句话切成两半的稳妥下限)
+    var hangTime: TimeInterval = 0.45
     /// 一句话最长多少秒,超过强制切断送翻
     var maxUtterance: TimeInterval = 20
     /// 启动后先校准底噪多久(期间不触发)
