@@ -3,19 +3,8 @@ import Combine
 import Translation
 import AVFoundation
 
-/// 整条流水线的调度中心,支持两套引擎:
-///
-/// 端上(v1,离线免费):
-///   麦克风 -> VAD 断句 -> 双路 SFSpeech 识别判语种 -> Translation 框架翻译
-///   -> AVSpeechSynthesizer 合成 -> 对应声道播放
-///
-/// 云端(v2,低延迟高质量):
-///   麦克风 -> VAD 断句(顺带判说话人性别)
-///   -> 流式识别(Scribe v2 单路自动判语种,或双路 Deepgram)
-///   -> Claude 流式翻译(带上下文) -> 按句切分 -> ElevenLabs 流式合成(性别匹配)
-///   -> 音频块边到边播;翻译与合成并行,首句按逗号就开播
-///
-/// 每一段失败都会在界面上给出可读的原因,方便现场定位。
+/// 整条流水线的调度中心,三套引擎:
+/// 端上(离线免费)/ 云端(Scribe + Claude + ElevenLabs,全双工排队)/ OpenAI 实时(边听边译)
 @MainActor
 final class TranslatorCore: ObservableObject {
     enum PipelineState {
@@ -25,6 +14,7 @@ final class TranslatorCore: ObservableObject {
     enum Engine: String, CaseIterable {
         case onDevice
         case cloud
+        case openai
     }
 
     enum ASRProvider: String, CaseIterable {
@@ -67,6 +57,9 @@ final class TranslatorCore: ObservableObject {
     @Published var elevenKey: String = KeychainStore.get("elevenKey") {
         didSet { KeychainStore.set(elevenKey, for: "elevenKey") }
     }
+    @Published var openaiKey: String = KeychainStore.get("openaiKey") {
+        didSet { KeychainStore.set(openaiKey, for: "openaiKey") }
+    }
     @Published var elevenVoiceId: String = UserDefaults.standard.string(forKey: "voiceId") ?? "21m00Tcm4TlvDq8ikWAM" {
         didSet { UserDefaults.standard.set(elevenVoiceId, forKey: "voiceId") }
     }
@@ -88,8 +81,18 @@ final class TranslatorCore: ObservableObject {
     private let scribeASR = ScribeASR()
     private let cloudTranslator = ClaudeTranslator()
     private let cloudTTS = ElevenLabsTTS()
+    private let openaiTranslator = OpenAIRealtimeTranslator()
     private var bag = Set<AnyCancellable>()
     private var lastGender: [Lang: SpeakerGender] = [:]
+
+    private var pipeline: Task<Void, Never>?
+    private var backlog = 0
+
+    private var liveSource = ""
+    private var liveTarget: [Lang: String] = [:]
+    private var liveFlushTask: Task<Void, Never>?
+    private var playingUntil = Date.distantPast
+    private var unmuteTask: Task<Void, Never>?
 
     init() {
         $vadThreshold
@@ -111,13 +114,14 @@ final class TranslatorCore: ObservableObject {
                 errorMessage = "需要麦克风权限,请到 设置 > 隐私与安全 中开启"
                 return
             }
-            if engine == .onDevice {
+            switch engine {
+            case .onDevice:
                 let speechOK = await DualRecognizer.requestPermission()
                 guard speechOK else {
                     errorMessage = "需要语音识别权限,请到 设置 > 隐私与安全 中开启"
                     return
                 }
-            } else {
+            case .cloud:
                 guard !anthropicKey.isEmpty, !elevenKey.isEmpty else {
                     errorMessage = "云端模式需要先在设置里填入 Anthropic 和 ElevenLabs 的 API Key"
                     return
@@ -126,10 +130,19 @@ final class TranslatorCore: ObservableObject {
                     errorMessage = "选择 Deepgram 识别需要填入 Deepgram API Key,或切换到 Scribe"
                     return
                 }
+            case .openai:
+                guard !openaiKey.isEmpty else {
+                    errorMessage = "OpenAI 实时模式需要先在设置里填入 OpenAI API Key"
+                    return
+                }
             }
             do {
                 try audio.configureSession()
-                engine == .onDevice ? wireLocal() : wireCloud()
+                switch engine {
+                case .onDevice: wireLocal()
+                case .cloud: wireCloud()
+                case .openai: wireOpenAI()
+                }
                 try audio.start()
                 running = true
                 state = .listening
@@ -145,8 +158,15 @@ final class TranslatorCore: ObservableObject {
         localRecognizer.cancel()
         deepgramASR.disconnect()
         scribeASR.disconnect()
+        openaiTranslator.disconnect()
         cloudTranslator.reset()
         detector.reset()
+        pipeline?.cancel()
+        pipeline = nil
+        backlog = 0
+        liveFlushTask?.cancel()
+        unmuteTask?.cancel()
+        flushLive()
         running = false
         state = .idle
         partialText = ""
@@ -179,7 +199,12 @@ final class TranslatorCore: ObservableObject {
         }
     }
 
-    // MARK: - 端上管线(v1)
+    private func setPlaying(_ playing: Bool) {
+        state = playing ? .playing : (backlog > 0 ? .translating : .listening)
+        detector.suppressed = playing && audio.voiceProcessingOn
+    }
+
+    // MARK: - 端上管线
 
     private func wireLocal() {
         localRecognizer.onPartial = { [weak self] text in
@@ -188,21 +213,16 @@ final class TranslatorCore: ObservableObject {
         detector.threshold = vadThreshold
         detector.onStart = { [localRecognizer] in localRecognizer.begin() }
         detector.forward = { [localRecognizer] buffer in localRecognizer.append(buffer) }
-        detector.onEnd = { [weak self] in
-            Task { @MainActor in await self?.finishLocalUtterance() }
+        detector.onEnd = { [weak self] gender in
+            Task { @MainActor in await self?.finishLocalUtterance(detected: gender) }
         }
         detector.reset()
         audio.onBuffer = { [detector] buffer in detector.feed(buffer) }
     }
 
-    private func finishLocalUtterance() async {
+    private func finishLocalUtterance(detected: SpeakerGender?) async {
         state = .translating
-        defer {
-            detector.resume()
-            if running { state = .listening }
-        }
-
-        let detected = detector.takeGender()
+        defer { if running { state = .listening } }
 
         guard let (text, lang) = await localRecognizer.end() else {
             partialText = ""
@@ -220,7 +240,7 @@ final class TranslatorCore: ObservableObject {
             entries.append(TranscriptEntry(lang: lang, original: text, translation: response.targetText))
             errorMessage = nil
 
-            state = .playing
+            setPlaying(true)
             let targetLang = lang.opposite
             let gender = resolveGender(detected: detected, lang: lang)
             let buffers = await localSynth.render(
@@ -232,12 +252,13 @@ final class TranslatorCore: ObservableObject {
             )
             let playOnLeft = (targetLang == .zh) ? zhOnLeft : !zhOnLeft
             await audio.play(buffers: buffers, onLeft: playOnLeft)
+            setPlaying(false)
         } catch {
             errorMessage = "翻译失败: \(error.localizedDescription)"
         }
     }
 
-    // MARK: - 云端管线(v2)
+    // MARK: - 云端管线(全双工)
 
     private var keytermList: [String] {
         scribeKeyterms
@@ -268,48 +289,50 @@ final class TranslatorCore: ObservableObject {
             detector.onStart = { [deepgramASR] in deepgramASR.beginUtterance() }
             detector.forward = { [deepgramASR] buffer in deepgramASR.append(buffer) }
         }
-        detector.onEnd = { [weak self] in
-            Task { @MainActor in await self?.finishCloudUtterance() }
+        detector.onEnd = { [weak self] gender in
+            Task { @MainActor in self?.cloudUtteranceEnded(detected: gender) }
         }
         detector.reset()
         audio.onBuffer = { [detector] buffer in detector.feed(buffer) }
     }
 
-    private func finishCloudUtterance() async {
-        state = .translating
-        let started = Date()
-        defer {
-            detector.resume()
-            if running { state = .listening }
-        }
-
-        let detected = detector.takeGender()
-
+    private func cloudUtteranceEnded(detected: SpeakerGender?) {
         let hadPartial = !partialText.isEmpty
-        let recognized: (text: String, lang: Lang)?
-        if asrProvider == .scribe {
-            if let u = await scribeASR.endUtterance() {
-                recognized = (u.text, u.lang)
+        partialText = ""
+        backlog += 1
+        if state == .listening { state = .translating }
+
+        let provider = asrProvider
+        let scribe = scribeASR
+        let deepgram = deepgramASR
+        let recognizing = Task<(text: String, lang: Lang)?, Never> {
+            if provider == .scribe {
+                if let u = await scribe.endUtterance() { return (u.text, u.lang) }
             } else {
-                recognized = nil
+                if let u = await deepgram.endUtterance() { return (u.text, u.lang) }
             }
-        } else {
-            if let u = await deepgramASR.endUtterance() {
-                recognized = (u.text, u.lang)
-            } else {
-                recognized = nil
-            }
+            return nil
         }
 
+        let previous = pipeline
+        pipeline = Task { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            let result = await recognizing.value
+            await self.processCloud(result, detected: detected, hadPartial: hadPartial)
+            self.backlog = max(0, self.backlog - 1)
+            if self.running, self.backlog == 0, self.state != .playing { self.state = .listening }
+        }
+    }
+
+    private func processCloud(_ recognized: (text: String, lang: Lang)?, detected: SpeakerGender?, hadPartial: Bool) async {
+        let started = Date()
         guard let utterance = recognized else {
-            partialText = ""
-            // 有过中间字幕却没拿到终稿:识别端超时或重复句被丢弃
             if hadPartial {
                 errorMessage = "识别未返回终稿(\(Self.elapsed(started))),网络弱或与上一句重复"
             }
             return
         }
-        partialText = ""
 
         let lang = utterance.lang
         let targetLang = lang.opposite
@@ -320,7 +343,6 @@ final class TranslatorCore: ObservableObject {
         var full = ""
         var chunk = ""
         var firstChunk = true
-        var ttsFailures: [String] = []
 
         let (sentences, feeder) = AsyncStream<String>.makeStream()
         let speaker = Task { [weak self] in
@@ -340,21 +362,21 @@ final class TranslatorCore: ObservableObject {
                 chunk += token
                 while let sentence = Self.takeSentence(&chunk, eager: firstChunk) {
                     firstChunk = false
-                    state = .playing
+                    setPlaying(true)
                     feeder.yield(sentence)
                 }
             }
             let rest = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
             if !rest.isEmpty {
-                state = .playing
+                setPlaying(true)
                 feeder.yield(rest)
             }
             feeder.finish()
-            ttsFailures = await speaker.value
+            let ttsFailures = await speaker.value
 
             let translation = full.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !translation.isEmpty else {
-                errorMessage = "译文为空(原文只有口头语)"
+                setPlaying(false)
                 return
             }
             entries.append(TranscriptEntry(lang: lang, original: utterance.text, translation: translation))
@@ -367,14 +389,15 @@ final class TranslatorCore: ObservableObject {
             }
 
             await audio.finishStream(onLeft: playOnLeft)
+            setPlaying(false)
         } catch {
             feeder.finish()
             _ = await speaker.value
+            setPlaying(false)
             errorMessage = "翻译失败(\(Self.elapsed(started))): \(error.localizedDescription)"
         }
     }
 
-    /// 播一句译文:优先 ElevenLabs 云端音色,失败自动降级系统语音。返回失败原因(成功返回 nil)
     private func speakSentence(_ text: String, lang: Lang, gender: SpeakerGender, voiceId: String, playOnLeft: Bool) async -> String? {
         do {
             try await cloudTTS.stream(text: text, apiKey: elevenKey, voiceId: voiceId) { [audio] buffer in
@@ -389,6 +412,82 @@ final class TranslatorCore: ObservableObject {
             await audio.play(buffers: buffers, onLeft: playOnLeft)
             return error.localizedDescription
         }
+    }
+
+    // MARK: - OpenAI 实时管线(边听边译)
+
+    private func wireOpenAI() {
+        liveSource = ""
+        liveTarget = [:]
+        openaiTranslator.onSourceText = { [weak self] text in
+            Task { @MainActor in self?.appendLiveSource(text) }
+        }
+        openaiTranslator.onTargetText = { [weak self] text, lang in
+            Task { @MainActor in self?.appendLiveTarget(text, lang: lang) }
+        }
+        openaiTranslator.onTargetAudio = { [weak self] buffer, lang in
+            Task { @MainActor in
+                guard let self else { return }
+                let playOnLeft = (lang == .zh) ? self.zhOnLeft : !self.zhOnLeft
+                self.audio.scheduleStream(buffer, onLeft: playOnLeft)
+                self.noteAudioScheduled(seconds: Double(buffer.frameLength) / 24_000)
+            }
+        }
+        openaiTranslator.onError = { [weak self] message in
+            Task { @MainActor in self?.errorMessage = message }
+        }
+        openaiTranslator.connect(apiKey: openaiKey)
+        audio.onBuffer = { [openaiTranslator] buffer in openaiTranslator.append(buffer) }
+    }
+
+    private func noteAudioScheduled(seconds: Double) {
+        let now = Date()
+        let base = max(now, playingUntil)
+        playingUntil = base.addingTimeInterval(seconds)
+        state = .playing
+        if audio.voiceProcessingOn {
+            openaiTranslator.setMuted(true)
+        }
+        unmuteTask?.cancel()
+        let wait = playingUntil.timeIntervalSince(now) + 0.3
+        unmuteTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, wait) * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.openaiTranslator.setMuted(false)
+            if self.running { self.state = .listening }
+        }
+    }
+
+    private func appendLiveSource(_ text: String) {
+        liveSource += text
+        partialText = liveSource
+        scheduleLiveFlush()
+    }
+
+    private func appendLiveTarget(_ text: String, lang: Lang) {
+        liveTarget[lang, default: ""] += text
+        scheduleLiveFlush()
+    }
+
+    private func scheduleLiveFlush() {
+        liveFlushTask?.cancel()
+        liveFlushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled else { return }
+            self?.flushLive()
+        }
+    }
+
+    private func flushLive() {
+        let source = liveSource.trimmingCharacters(in: .whitespacesAndNewlines)
+        for (lang, text) in liveTarget {
+            let translation = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !translation.isEmpty else { continue }
+            entries.append(TranscriptEntry(lang: lang.opposite, original: source, translation: translation))
+        }
+        liveSource = ""
+        liveTarget = [:]
+        partialText = ""
     }
 
     private static func elapsed(_ since: Date) -> String {
