@@ -3,10 +3,10 @@ import AVFoundation
 
 /// ElevenLabs Scribe v2 Realtime 单路流式识别。
 ///
-/// 和双路 Deepgram 的区别:一条连接同时听中英文,模型自带语种识别,
-/// 不再靠两路置信度猜。音频全程持续上送(静默期送静音帧保持会话),
+/// 一条连接同时听中英文,模型自带语种识别。音频全程持续上送(静默期送静音帧保持会话),
 /// 句尾由 App 的 VAD 决定,发 commit 拿本句终稿;弱网下终稿超时就用最后一条中间结果顶上。
 /// 连接尚未就绪时的音频先在本地排队,session_started 后补发,首句不丢字。
+/// 与上一句完全相同的原文视为回声或重复终稿,直接丢弃。
 final class ScribeASR {
     struct Utterance {
         let text: String
@@ -36,6 +36,7 @@ final class ScribeASR {
     private var committedText: String?
     private var committedLang: String?
     private var lastPartial = ""
+    private var lastDelivered = ""
 
     /// 100 毫秒 16k s16le 静音
     private static let silenceChunk = Data(count: 3_200)
@@ -46,6 +47,7 @@ final class ScribeASR {
         self.keyterms = Array(keyterms.prefix(50))
         active = true
         fatal = false
+        lastDelivered = ""
         open()
 
         // 静默期每 100 毫秒补一帧静音,保持会话连续,也让模型有足够上下文
@@ -112,8 +114,8 @@ final class ScribeASR {
         send(audio: data, commit: false)
     }
 
-    /// 句尾:发 commit,等本句终稿(最多 5 秒,弱网留余量),语种信息稍后到再等 0.4 秒。
-    /// 终稿等不到就用最后一条中间结果,不丢句。
+    /// 句尾:发 commit,等本句终稿(最多 5 秒),语种信息稍后到再等 0.4 秒。
+    /// 终稿等不到就用最后一条中间结果;和上一句相同的原文丢弃。
     func endUtterance() async -> Utterance? {
         guard socket != nil else { return nil }
         committedText = nil
@@ -137,6 +139,9 @@ final class ScribeASR {
         committedLang = nil
         lastPartial = ""
         guard !text.isEmpty else { return nil }
+        // 和上一句完全相同的原文视为回声或重复终稿,丢弃
+        guard text != lastDelivered else { return nil }
+        lastDelivered = text
         return Utterance(text: text, lang: Self.decideLang(text: text, code: code))
     }
 
