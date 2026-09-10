@@ -7,14 +7,15 @@ import AVFoundation
 /// 收音始终用 iPhone 自带麦克风,耳机保持 A2DP 高音质输出。
 ///
 /// 外放(手机喇叭 / 车机)时自动打开系统语音处理(回声消除 + 噪音抑制 + 自动增益)。
-/// 语音处理首次启用会触发一次引擎重配置,所以启动时先预热一遍,
-/// 并且所有"等播完"的地方都带超时,任何情况下流水线不会卡死。
+/// 语音处理是单声道的,所以连着耳机时必须关掉,否则左右耳没有区别;
+/// 路由一变(耳机连上 / 断开)就立刻按新路由重新配置。
 final class AudioManager {
     let engine = AVAudioEngine()
     private let playerLeft = AVAudioPlayerNode()
     private let playerRight = AVAudioPlayerNode()
     private var observers: [NSObjectProtocol] = []
     private var graphBuilt = false
+    private var running = false
 
     /// TTS 播放统一转换到的单声道格式,经 pan 混入立体声输出
     let playbackFormat = AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1)!
@@ -32,7 +33,8 @@ final class AudioManager {
         let outs = AVAudioSession.sharedInstance().currentRoute.outputs
         guard let first = outs.first else { return "无" }
         switch first.portType {
-        case .bluetoothA2DP, .bluetoothLE, .bluetoothHFP: return first.portName
+        case .bluetoothA2DP, .bluetoothLE, .bluetoothHFP:
+            return voiceProcessingOn ? "\(first.portName)·降噪" : first.portName
         case .builtInSpeaker: return voiceProcessingOn ? "扬声器·降噪" : "扬声器"
         case .builtInReceiver: return "听筒"
         case .headphones: return "有线耳机"
@@ -83,6 +85,7 @@ final class AudioManager {
         ) { [weak self] _ in
             guard let self else { return }
             self.applyOutputOverride()
+            self.reconfigureForRouteIfNeeded()
             self.restartEngineIfNeeded()
             self.notifyRoute()
         })
@@ -114,7 +117,7 @@ final class AudioManager {
     }
 
     private func restartEngineIfNeeded() {
-        guard graphBuilt, !engine.isRunning else { return }
+        guard graphBuilt, running, !engine.isRunning else { return }
         engine.prepare()
         do {
             try engine.start()
@@ -125,24 +128,57 @@ final class AudioManager {
         }
     }
 
-    func start() throws {
+    /// 按当前路由决定语音处理开关:有蓝牙耳机 -> 关(保立体声),外放 -> 开(降噪)。
+    /// 返回是否真的切换了。
+    private func applyVoiceProcessing() -> Bool {
         let input = engine.inputNode
-
-        // 外放时开语音处理,耳机时关。必须在引擎启动前设置。
         let wantVP = !hasBluetoothOutput
-        var vpToggled = false
-        if input.isVoiceProcessingEnabled != wantVP {
-            do {
-                try input.setVoiceProcessingEnabled(wantVP)
-                voiceProcessingOn = wantVP
-                vpToggled = true
-            } catch {
-                print("语音处理切换失败: \(error)")
-                voiceProcessingOn = input.isVoiceProcessingEnabled
-            }
-        } else {
-            voiceProcessingOn = wantVP
+        guard input.isVoiceProcessingEnabled != wantVP else {
+            voiceProcessingOn = input.isVoiceProcessingEnabled
+            return false
         }
+        do {
+            try input.setVoiceProcessingEnabled(wantVP)
+        } catch {
+            print("语音处理切换失败: \(error)")
+        }
+        voiceProcessingOn = input.isVoiceProcessingEnabled
+        return true
+    }
+
+    private func installTap() {
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+            self?.onBuffer?(buffer)
+        }
+    }
+
+    /// 耳机连上 / 断开后,如果语音处理状态和新路由不匹配,停下引擎重配一次
+    private func reconfigureForRouteIfNeeded() {
+        guard running, graphBuilt else { return }
+        let input = engine.inputNode
+        let wantVP = !hasBluetoothOutput
+        guard input.isVoiceProcessingEnabled != wantVP else { return }
+
+        input.removeTap(onBus: 0)
+        engine.stop()
+        _ = applyVoiceProcessing()
+        installTap()
+        engine.prepare()
+        do {
+            try engine.start()
+            playerLeft.play()
+            playerRight.play()
+        } catch {
+            print("路由切换后引擎重启失败: \(error)")
+        }
+    }
+
+    func start() throws {
+        running = true
+        let vpToggled = applyVoiceProcessing()
 
         if !graphBuilt {
             engine.attach(playerLeft)
@@ -165,12 +201,7 @@ final class AudioManager {
             engine.stop()
         }
 
-        let format = input.outputFormat(forBus: 0)
-        input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
-            self?.onBuffer?(buffer)
-        }
-
+        installTap()
         engine.prepare()
         try engine.start()
         playerLeft.play()
@@ -179,6 +210,7 @@ final class AudioManager {
     }
 
     func stop() {
+        running = false
         engine.inputNode.removeTap(onBus: 0)
         playerLeft.stop()
         playerRight.stop()
