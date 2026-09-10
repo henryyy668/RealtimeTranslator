@@ -11,7 +11,7 @@ enum SpeakerGender: String {
 ///
 /// 状态机:启动后先校准 1 秒底噪(只听不判)-> 静音 -> 音量超过触发线 -> onStart 并转发缓冲 ->
 /// 持续静音超过 hangTime(或说话超过 maxUtterance)-> onEnd 并自动暂停(半双工),
-/// 等流水线处理完后由外部调用 resume() 恢复。
+/// 等流水线处理完后由外部调用 resume() 恢复;恢复后先空 0.4 秒吃掉喇叭尾音。
 ///
 /// 触发线 = max(用户设定的最低阈值, 环境底噪 x 3)。
 final class UtteranceDetector {
@@ -23,6 +23,8 @@ final class UtteranceDetector {
     var maxUtterance: TimeInterval = 20
     /// 启动后先校准底噪多久(期间不触发)
     var warmupTime: TimeInterval = 1.0
+    /// 播报结束后多久内不触发(吃掉喇叭尾音)
+    var postPlaybackGuard: TimeInterval = 0.4
     /// 说话前保留几个缓冲,避免吃掉第一个音节
     private let prerollCount = 4
 
@@ -55,7 +57,7 @@ final class UtteranceDetector {
         let level = Self.rms(buffer)
         let now = Date()
 
-        // 校准期:只测底噪,不触发。第一帧直接采纳为初值,后面平滑
+        // 校准 / 保护期:只测底噪,不触发
         if now < warmupUntil {
             if calibrated {
                 noiseFloor = noiseFloor * 0.8 + level * 0.2
@@ -125,11 +127,12 @@ final class UtteranceDetector {
         return nil
     }
 
-    /// 流水线处理完毕,恢复聆听
+    /// 流水线处理完毕,恢复聆听。先空一小段吃掉喇叭尾音,避免把自己的播报当成新的一句
     func resume() {
         preroll.removeAll()
         speaking = false
         enabled = true
+        warmupUntil = Date().addingTimeInterval(postPlaybackGuard)
     }
 
     /// 会话开始时调用:清状态并进入 1 秒底噪校准
