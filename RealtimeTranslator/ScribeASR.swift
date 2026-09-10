@@ -1,13 +1,7 @@
 import Foundation
 import AVFoundation
 
-/// ElevenLabs Scribe v2 Realtime 单路流式识别。
-///
-/// 一条连接同时听中英文,模型自带语种识别。音频全程持续上送(静默期送静音帧保持会话),
-/// 句尾由 App 的 VAD 决定,发 commit 拿本句终稿;弱网下终稿超时就用最后一条中间结果顶上。
-/// 连接尚未就绪时的音频先在本地排队,session_started 后补发,首句不丢字。
-/// 与上一句完全相同的原文视为回声或重复终稿,直接丢弃。
-/// 终稿一到立刻放行,不等语种信息(语种由文字本身判断)。
+/// ElevenLabs Scribe v2 Realtime 单路流式识别(全双工版)。
 final class ScribeASR {
     struct Utterance {
         let text: String
@@ -26,23 +20,17 @@ final class ScribeASR {
     private var idleTimer: Timer?
     private var lastAudioSent = Date.distantPast
 
-    /// 连接是否已收到 session_started
     private var ready = false
-    /// 就绪前排队的消息(音频 + 是否 commit),最多约 8 秒
     private var pending: [(Data, Bool)] = []
     private let pendingLimit = 100
     private let queue = DispatchQueue(label: "scribe.send")
 
-    private var awaitingCommit = false
-    private var committedText: String?
-    private var committedLang: String?
+    private var waiters: [CommitWaiter] = []
     private var lastPartial = ""
     private var lastDelivered = ""
 
-    /// 100 毫秒 16k s16le 静音
     private static let silenceChunk = Data(count: 3_200)
 
-    /// keyterms:常被听错的词,最多 50 个,每个 20 字符以内(ElevenLabs 对此加收 20% 费用)
     func connect(apiKey: String, keyterms: [String]) {
         self.apiKey = apiKey
         self.keyterms = Array(keyterms.prefix(50))
@@ -51,7 +39,6 @@ final class ScribeASR {
         lastDelivered = ""
         open()
 
-        // 静默期每 100 毫秒补一帧静音,保持会话连续,也让模型有足够上下文
         idleTimer?.invalidate()
         idleTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let self, self.active, self.socket != nil, self.ready else { return }
@@ -92,70 +79,57 @@ final class ScribeASR {
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         ready = false
-        queue.sync { pending.removeAll() }
-        awaitingCommit = false
-        committedText = nil
-        committedLang = nil
+        queue.sync {
+            pending.removeAll()
+            let stale = waiters
+            waiters.removeAll()
+            stale.forEach { $0.resume(nil) }
+        }
         lastPartial = ""
     }
 
-    /// 一句话开始(VAD 触发,音频线程调用)
     func beginUtterance() {
-        committedText = nil
-        committedLang = nil
         lastPartial = ""
         if socket == nil, active, !fatal {
             open()
         }
     }
 
-    /// 音频线程:降采样到 16k s16le 后上送
     func append(_ buffer: AVAudioPCMBuffer) {
         guard let data = downsampler.convert(buffer) else { return }
         send(audio: data, commit: false)
     }
 
-    /// 句尾:发 commit,等本句终稿(最多 5 秒),到了立刻放行。
-    /// 终稿等不到就用最后一条中间结果;和上一句相同的原文丢弃。
     func endUtterance() async -> Utterance? {
         guard socket != nil else { return nil }
-        committedText = nil
-        committedLang = nil
-        awaitingCommit = true
-        send(audio: Self.silenceChunk, commit: true)
-
-        let deadline = Date().addingTimeInterval(5.0)
-        while Date() < deadline, committedText == nil {
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
-        awaitingCommit = false
-
-        let text = (committedText ?? lastPartial).trimmingCharacters(in: .whitespacesAndNewlines)
-        let code = committedLang
-        committedText = nil
-        committedLang = nil
+        let partialSnapshot = lastPartial
         lastPartial = ""
+
+        let committed: String? = await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            let waiter = CommitWaiter(cont)
+            queue.sync { waiters.append(waiter) }
+            send(audio: Self.silenceChunk, commit: true)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 5.0) { [weak self] in
+                self?.queue.sync { self?.waiters.removeAll { $0 === waiter } }
+                waiter.resume(nil)
+            }
+        }
+
+        let text = (committed ?? partialSnapshot).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
-        // 和上一句完全相同的原文视为回声或重复终稿,丢弃
         guard text != lastDelivered else { return nil }
         lastDelivered = text
-        return Utterance(text: text, lang: Self.decideLang(text: text, code: code))
+        return Utterance(text: text, lang: Self.decideLang(text: text))
     }
 
-    /// 先看文字本身的文字系统(最可靠),再看模型报的语种码
-    private static func decideLang(text: String, code: String?) -> Lang {
+    private static func decideLang(text: String) -> Lang {
         let han = text.unicodeScalars.filter { $0.properties.isIdeographic }.count
         let latin = text.unicodeScalars.filter { $0.isASCII && $0.properties.isAlphabetic }.count
         if han >= 2 || (han > 0 && latin == 0) { return .zh }
         if latin > 0 && han == 0 { return .en }
-        if let code = code?.lowercased() {
-            if code.hasPrefix("zh") || code.hasPrefix("cmn") || code.hasPrefix("yue") { return .zh }
-            if code.hasPrefix("en") { return .en }
-        }
         return han > 0 ? .zh : .en
     }
 
-    /// 未就绪时排队,就绪后直发
     private func send(audio: Data, commit: Bool) {
         queue.sync {
             if !ready {
@@ -183,7 +157,6 @@ final class ScribeASR {
         socket.send(.string(text)) { _ in }
     }
 
-    /// 连接就绪:把排队的音频按顺序补发
     private func flushPending() {
         queue.sync {
             ready = true
@@ -236,7 +209,7 @@ final class ScribeASR {
         switch type {
         case "session_started":
             flushPending()
-        case "warning", "committed_transcript_entities":
+        case "warning", "committed_transcript_entities", "committed_transcript_with_timestamps":
             break
         case "partial_transcript":
             let text = ((obj["text"] as? String) ?? "").trimmingCharacters(in: .whitespaces)
@@ -245,16 +218,11 @@ final class ScribeASR {
                 onPartial?(text)
             }
         case "committed_transcript":
-            if awaitingCommit {
-                committedText = (obj["text"] as? String) ?? ""
+            let text = (obj["text"] as? String) ?? ""
+            let waiter: CommitWaiter? = queue.sync {
+                waiters.isEmpty ? nil : waiters.removeFirst()
             }
-        case "committed_transcript_with_timestamps":
-            if awaitingCommit {
-                committedLang = obj["language_code"] as? String
-                if committedText == nil {
-                    committedText = (obj["text"] as? String) ?? ""
-                }
-            }
+            waiter?.resume(text)
         case "auth_error":
             fatal = true
             onError?("Scribe 鉴权失败:ElevenLabs Key 无效,或该 Key 没有 Speech to Text 权限")
@@ -271,5 +239,23 @@ final class ScribeASR {
             let detail = (obj["error"] as? String) ?? ""
             onError?("Scribe 识别出错(\(type)): \(detail)")
         }
+    }
+}
+
+private final class CommitWaiter {
+    private var resumed = false
+    private let lock = NSLock()
+    private let continuation: CheckedContinuation<String?, Never>
+
+    init(_ continuation: CheckedContinuation<String?, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(_ text: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !resumed else { return }
+        resumed = true
+        continuation.resume(returning: text)
     }
 }
