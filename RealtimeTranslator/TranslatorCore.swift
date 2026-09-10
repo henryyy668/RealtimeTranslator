@@ -14,6 +14,8 @@ import AVFoundation
 ///   -> 流式识别(Scribe v2 单路自动判语种,或双路 Deepgram)
 ///   -> Claude 流式翻译(带上下文) -> 按句切分 -> ElevenLabs 流式合成(性别匹配)
 ///   -> 音频块边到边播;翻译与合成并行,首句按逗号就开播
+///
+/// 每一段失败都会在界面上给出可读的原因,方便现场定位。
 @MainActor
 final class TranslatorCore: ObservableObject {
     enum PipelineState {
@@ -25,13 +27,11 @@ final class TranslatorCore: ObservableObject {
         case cloud
     }
 
-    /// 云端识别用哪家
     enum ASRProvider: String, CaseIterable {
         case scribe
         case deepgram
     }
 
-    /// 译文用什么声音:跟随说话人性别 / 固定男声 / 固定女声
     enum VoiceMode: String, CaseIterable {
         case auto
         case male
@@ -45,19 +45,16 @@ final class TranslatorCore: ObservableObject {
     @Published var errorMessage: String?
     @Published var outputName = ""
 
-    // 通用设置
-    @Published var zhOnLeft = true          // 中文译文送到左耳(说中文的人戴左耳)
-    @Published var speechRate: Float = 0.5  // 端上引擎的播报语速
+    @Published var zhOnLeft = true
+    @Published var speechRate: Float = 0.5
     @Published var vadThreshold: Float = 0.015
 
-    // 引擎选择与云端凭据(Key 存钥匙串)
     @Published var engine: Engine = Engine(rawValue: UserDefaults.standard.string(forKey: "engine") ?? "") ?? .onDevice {
         didSet { UserDefaults.standard.set(engine.rawValue, forKey: "engine") }
     }
     @Published var asrProvider: ASRProvider = ASRProvider(rawValue: UserDefaults.standard.string(forKey: "asrProvider") ?? "") ?? .scribe {
         didSet { UserDefaults.standard.set(asrProvider.rawValue, forKey: "asrProvider") }
     }
-    /// Scribe 关键词提示,逗号分隔,常被听错的词放这里
     @Published var scribeKeyterms: String = UserDefaults.standard.string(forKey: "scribeKeyterms") ?? "" {
         didSet { UserDefaults.standard.set(scribeKeyterms, forKey: "scribeKeyterms") }
     }
@@ -70,11 +67,9 @@ final class TranslatorCore: ObservableObject {
     @Published var elevenKey: String = KeychainStore.get("elevenKey") {
         didSet { KeychainStore.set(elevenKey, for: "elevenKey") }
     }
-    /// 女声 Voice ID(默认 Rachel)
     @Published var elevenVoiceId: String = UserDefaults.standard.string(forKey: "voiceId") ?? "21m00Tcm4TlvDq8ikWAM" {
         didSet { UserDefaults.standard.set(elevenVoiceId, forKey: "voiceId") }
     }
-    /// 男声 Voice ID(默认 Adam)
     @Published var elevenVoiceMaleId: String = UserDefaults.standard.string(forKey: "voiceMaleId") ?? "pNInz6obpgDQGcFmaJgB" {
         didSet { UserDefaults.standard.set(elevenVoiceMaleId, forKey: "voiceMaleId") }
     }
@@ -82,7 +77,6 @@ final class TranslatorCore: ObservableObject {
         didSet { UserDefaults.standard.set(voiceMode.rawValue, forKey: "voiceMode") }
     }
 
-    // 端上翻译会话由 ContentView 的 translationTask 注入
     var zhToEn: TranslationSession?
     var enToZh: TranslationSession?
 
@@ -95,7 +89,6 @@ final class TranslatorCore: ObservableObject {
     private let cloudTranslator = ClaudeTranslator()
     private let cloudTTS = ElevenLabsTTS()
     private var bag = Set<AnyCancellable>()
-    /// 每种语言的说话人上一次判出的性别,判不出时沿用
     private var lastGender: [Lang: SpeakerGender] = [:]
 
     init() {
@@ -159,7 +152,6 @@ final class TranslatorCore: ObservableObject {
         partialText = ""
     }
 
-    /// 端上模式:触发系统翻译模型下载(首次使用需要)
     func downloadLanguages() {
         Task {
             do {
@@ -172,7 +164,6 @@ final class TranslatorCore: ObservableObject {
         }
     }
 
-    /// 决定这句译文用男声还是女声
     private func resolveGender(detected: SpeakerGender?, lang: Lang) -> SpeakerGender {
         switch voiceMode {
         case .male:
@@ -286,14 +277,15 @@ final class TranslatorCore: ObservableObject {
 
     private func finishCloudUtterance() async {
         state = .translating
+        let started = Date()
         defer {
             detector.resume()
             if running { state = .listening }
         }
 
-        // 先把这句的性别判断取出来(识别期间就算好了,不额外花时间)
         let detected = detector.takeGender()
 
+        let hadPartial = !partialText.isEmpty
         let recognized: (text: String, lang: Lang)?
         if asrProvider == .scribe {
             if let u = await scribeASR.endUtterance() {
@@ -311,6 +303,10 @@ final class TranslatorCore: ObservableObject {
 
         guard let utterance = recognized else {
             partialText = ""
+            // 有过中间字幕却没拿到终稿:识别端超时或重复句被丢弃
+            if hadPartial {
+                errorMessage = "识别未返回终稿(\(Self.elapsed(started))),网络弱或与上一句重复"
+            }
             return
         }
         partialText = ""
@@ -324,14 +320,18 @@ final class TranslatorCore: ObservableObject {
         var full = ""
         var chunk = ""
         var firstChunk = true
+        var ttsFailures: [String] = []
 
-        // 合成在独立任务里按顺序跑,翻译不用等上一句合成完
         let (sentences, feeder) = AsyncStream<String>.makeStream()
         let speaker = Task { [weak self] in
+            var failures: [String] = []
             for await sentence in sentences {
-                guard let self else { return }
-                await self.speakSentence(sentence, lang: targetLang, gender: gender, voiceId: voiceId, playOnLeft: playOnLeft)
+                guard let self else { return failures }
+                if let failure = await self.speakSentence(sentence, lang: targetLang, gender: gender, voiceId: voiceId, playOnLeft: playOnLeft) {
+                    failures.append(failure)
+                }
             }
+            return failures
         }
 
         do {
@@ -350,36 +350,51 @@ final class TranslatorCore: ObservableObject {
                 feeder.yield(rest)
             }
             feeder.finish()
-            await speaker.value
+            ttsFailures = await speaker.value
 
             let translation = full.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !translation.isEmpty else { return }
+            guard !translation.isEmpty else {
+                errorMessage = "译文为空(原文只有口头语)"
+                return
+            }
             entries.append(TranscriptEntry(lang: lang, original: utterance.text, translation: translation))
             cloudTranslator.remember(source: utterance.text, target: translation, lang: lang)
-            errorMessage = nil
 
-            // 等这个声道队列里的音频全部播完再恢复聆听
+            if ttsFailures.isEmpty {
+                errorMessage = nil
+            } else {
+                errorMessage = "合成降级到系统语音: \(ttsFailures.first ?? "")"
+            }
+
             await audio.finishStream(onLeft: playOnLeft)
         } catch {
             feeder.finish()
-            await speaker.value
-            errorMessage = "云端管线出错: \(error.localizedDescription)"
+            _ = await speaker.value
+            errorMessage = "翻译失败(\(Self.elapsed(started))): \(error.localizedDescription)"
         }
     }
 
-    /// 播一句译文:优先 ElevenLabs 云端音色,失败自动降级系统语音(同样按性别选声音)
-    private func speakSentence(_ text: String, lang: Lang, gender: SpeakerGender, voiceId: String, playOnLeft: Bool) async {
+    /// 播一句译文:优先 ElevenLabs 云端音色,失败自动降级系统语音。返回失败原因(成功返回 nil)
+    private func speakSentence(_ text: String, lang: Lang, gender: SpeakerGender, voiceId: String, playOnLeft: Bool) async -> String? {
         do {
             try await cloudTTS.stream(text: text, apiKey: elevenKey, voiceId: voiceId) { [audio] buffer in
                 audio.scheduleStream(buffer, onLeft: playOnLeft)
             }
+            return nil
         } catch {
             let buffers = await localSynth.render(text, lang: lang, to: audio.playbackFormat, rate: speechRate, gender: gender)
+            if buffers.isEmpty {
+                return "ElevenLabs 失败且系统语音也无输出: \(error.localizedDescription)"
+            }
             await audio.play(buffers: buffers, onLeft: playOnLeft)
+            return error.localizedDescription
         }
     }
 
-    /// 从缓冲里切出一段可以先合成的文字。eager 为 true(首段)时逗号也算边界,首声更快。
+    private static func elapsed(_ since: Date) -> String {
+        String(format: "%.1f 秒", Date().timeIntervalSince(since))
+    }
+
     private static func takeSentence(_ buffer: inout String, eager: Bool) -> String? {
         var enders: Set<Character> = ["。", "!", "?", "!", "?", ".", ";", ";", "\n"]
         if eager {
