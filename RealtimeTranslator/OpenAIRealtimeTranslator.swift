@@ -4,8 +4,8 @@ import AVFoundation
 /// OpenAI gpt-realtime-translate 端到端语音翻译引擎(边听边译)。
 ///
 /// 一路麦克风音频同时喂给两个翻译会话:一个输出英文,一个输出中文。
-/// 模型自己判断源语言并边听边译。哪一路的源语言和目标语言相同,那一路的输出丢掉,
-/// 依据是源语言字幕(input_transcript)的文字系统和 elapsed_ms 时间对齐。
+/// 源语言字幕比翻译输出来得晚,所以每一路的输出先扣住一小段时间,
+/// 等字幕告诉我们"现在说的是哪种语言"之后再决定:源语言和本路目标语言相同就丢掉。
 final class OpenAIRealtimeTranslator {
     var onSourceText: ((String) -> Void)?
     var onTargetText: ((String, Lang) -> Void)?
@@ -13,7 +13,7 @@ final class OpenAIRealtimeTranslator {
     var onError: ((String) -> Void)?
 
     private var sessions: [Lang: TranslationSocket] = [:]
-    private let timeline = LanguageTimeline()
+    private let speaker = SpeakerLanguage()
     private var converter: AVAudioConverter?
     private var accumulator = Data()
     private let chunkBytes = 9_600
@@ -24,9 +24,10 @@ final class OpenAIRealtimeTranslator {
 
     func connect(apiKey: String) {
         disconnect()
-        timeline.reset()
+        speaker.reset()
         for target in [Lang.en, Lang.zh] {
-            let socket = TranslationSocket(target: target, apiKey: apiKey, transcribe: target == .en, timeline: timeline)
+            // 两个会话都开源语言字幕,谁先到用谁,判断更快
+            let socket = TranslationSocket(target: target, apiKey: apiKey, speaker: speaker)
             socket.onSourceText = { [weak self] text in self?.onSourceText?(text) }
             socket.onTargetText = { [weak self] text in self?.onTargetText?(text, target) }
             socket.onTargetAudio = { [weak self] data in
@@ -103,56 +104,55 @@ final class OpenAIRealtimeTranslator {
     }
 }
 
-private final class LanguageTimeline {
-    private var entries: [(ms: Int, lang: Lang)] = []
+/// 当前说话人正在说的语言,由源语言字幕的文字系统推断,带最近更新时间
+private final class SpeakerLanguage {
+    private var current: Lang?
+    private var updatedAt = Date.distantPast
     private let lock = NSLock()
 
     func reset() {
         lock.lock(); defer { lock.unlock() }
-        entries.removeAll()
+        current = nil
+        updatedAt = .distantPast
     }
 
-    func record(ms: Int, text: String) {
+    func observe(_ text: String) {
         let han = text.unicodeScalars.contains { $0.properties.isIdeographic }
         let latin = text.unicodeScalars.contains { $0.isASCII && $0.properties.isAlphabetic }
         let lang: Lang
         if han { lang = .zh } else if latin { lang = .en } else { return }
         lock.lock(); defer { lock.unlock() }
-        if let last = entries.last, last.ms == ms {
-            entries[entries.count - 1] = (ms, lang)
-        } else {
-            entries.append((ms, lang))
-        }
-        if entries.count > 400 {
-            entries.removeFirst(entries.count - 400)
-        }
+        current = lang
+        updatedAt = Date()
     }
 
-    func language(at ms: Int?) -> Lang? {
+    /// 最近 6 秒内听到的语言;更久没字幕就当不知道(放行)
+    func recent() -> Lang? {
         lock.lock(); defer { lock.unlock() }
-        guard let ms else { return entries.last?.lang }
-        return entries.last(where: { $0.ms <= ms + 600 })?.lang ?? entries.first?.lang
+        guard Date().timeIntervalSince(updatedAt) < 6 else { return nil }
+        return current
     }
 }
 
+/// 一个翻译会话:固定一个目标语言,输出先扣住 holdSeconds 再决定放不放
 private final class TranslationSocket {
     let target: Lang
     private let apiKey: String
-    private let transcribe: Bool
-    private let timeline: LanguageTimeline
+    private let speaker: SpeakerLanguage
     private var socket: URLSessionWebSocketTask?
     private var closing = false
+    private let queue = DispatchQueue(label: "openai.translate.hold")
+    private let holdSeconds: TimeInterval = 0.7
 
     var onSourceText: ((String) -> Void)?
     var onTargetText: ((String) -> Void)?
     var onTargetAudio: ((Data) -> Void)?
     var onError: ((String) -> Void)?
 
-    init(target: Lang, apiKey: String, transcribe: Bool, timeline: LanguageTimeline) {
+    init(target: Lang, apiKey: String, speaker: SpeakerLanguage) {
         self.target = target
         self.apiKey = apiKey
-        self.transcribe = transcribe
-        self.timeline = timeline
+        self.speaker = speaker
     }
 
     func open() {
@@ -164,15 +164,14 @@ private final class TranslationSocket {
         task.resume()
         receive(task)
 
-        var input: [String: Any] = ["noise_reduction": ["type": "far_field"]]
-        if transcribe {
-            input["transcription"] = ["model": "gpt-realtime-whisper"]
-        }
         send([
             "type": "session.update",
             "session": [
                 "audio": [
-                    "input": input,
+                    "input": [
+                        "noise_reduction": ["type": "far_field"],
+                        "transcription": ["model": "gpt-realtime-whisper"],
+                    ],
                     "output": ["language": target == .en ? "en" : "zh"],
                 ],
             ],
@@ -223,25 +222,32 @@ private final class TranslationSocket {
         }
     }
 
+    /// 扣住一小段时间再判断:源语言 == 本路目标语言 -> 丢;不知道 -> 放
+    private func hold(_ deliver: @escaping () -> Void) {
+        queue.asyncAfter(deadline: .now() + holdSeconds) { [weak self] in
+            guard let self, !self.closing else { return }
+            if self.speaker.recent() == self.target { return }
+            deliver()
+        }
+    }
+
     private func handle(_ raw: String) {
         guard let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = obj["type"] as? String else { return }
-        let elapsed = obj["elapsed_ms"] as? Int
 
         switch type {
         case "session.input_transcript.delta":
             let delta = (obj["delta"] as? String) ?? ""
-            timeline.record(ms: elapsed ?? 0, text: delta)
-            onSourceText?(delta)
+            speaker.observe(delta)
+            // 只用英文路的字幕更新界面,避免两路重复显示
+            if target == .en { onSourceText?(delta) }
         case "session.output_audio.delta":
-            if timeline.language(at: elapsed) == target { return }
-            if let b64 = obj["delta"] as? String, let audio = Data(base64Encoded: b64) {
-                onTargetAudio?(audio)
-            }
+            guard let b64 = obj["delta"] as? String, let audio = Data(base64Encoded: b64) else { return }
+            hold { [weak self] in self?.onTargetAudio?(audio) }
         case "session.output_transcript.delta":
-            if timeline.language(at: elapsed) == target { return }
-            onTargetText?((obj["delta"] as? String) ?? "")
+            let delta = (obj["delta"] as? String) ?? ""
+            hold { [weak self] in self?.onTargetText?(delta) }
         case "error":
             let err = obj["error"] as? [String: Any]
             onError?("OpenAI 翻译出错: \((err?["message"] as? String) ?? type)")
