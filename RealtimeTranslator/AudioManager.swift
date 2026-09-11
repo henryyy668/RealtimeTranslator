@@ -132,9 +132,9 @@ final class AudioManager {
     private func relinkMixerToOutput() {
         guard graphBuilt else { return }
         let hardware = engine.outputNode.outputFormat(forBus: 0)
-        let channels = max(1, min(2, hardware.channelCount))
-        let sampleRate = hardware.sampleRate > 0 ? hardware.sampleRate : 48_000
-        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: channels)
+        let channels: AVAudioChannelCount = hardware.channelCount >= 2 ? 2 : 1
+        let sampleRate: Double = hardware.sampleRate > 0 ? hardware.sampleRate : 48_000
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: channels) else { return }
         engine.disconnectNodeOutput(engine.mainMixerNode)
         engine.connect(engine.mainMixerNode, to: engine.outputNode, format: format)
     }
@@ -225,8 +225,4 @@ final class AudioManager {
     }
 
     func stop() {
-        running = false
-        engine.inputNode.removeTap(onBus: 0)
-        playerLeft.stop()
-        playerRight.stop()
-        engine
+        running
