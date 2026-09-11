@@ -7,8 +7,6 @@ import AVFoundation
 /// 收音始终用 iPhone 自带麦克风,耳机保持 A2DP 高音质输出。
 ///
 /// 外放(手机喇叭 / 车机)时自动打开系统语音处理(回声消除 + 噪音抑制 + 自动增益)。
-/// 语音处理是单声道的,连着耳机时必须关掉;而且它会改变输出格式,
-/// 所以每次切换都按硬件实际声道数把"混音器到输出"的连线拆掉重建,保证耳机时是立体声。
 final class AudioManager {
     let engine = AVAudioEngine()
     private let playerLeft = AVAudioPlayerNode()
@@ -128,19 +126,7 @@ final class AudioManager {
         }
     }
 
-    /// 把混音器重新连到输出节点,明确按硬件声道数连线:耳机 2 声道保立体声,喇叭 / 语音处理按硬件实际声道
-    private func relinkMixerToOutput() {
-        guard graphBuilt else { return }
-        let hardware = engine.outputNode.outputFormat(forBus: 0)
-        let channels: AVAudioChannelCount = hardware.channelCount >= 2 ? 2 : 1
-        let sampleRate: Double = hardware.sampleRate > 0 ? hardware.sampleRate : 48_000
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: channels) else { return }
-        engine.disconnectNodeOutput(engine.mainMixerNode)
-        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: format)
-    }
-
-    /// 按当前路由决定语音处理开关:有蓝牙耳机 -> 关(保立体声),外放 -> 开(降噪)。
-    /// 返回是否真的切换了。
+    /// 按当前路由决定语音处理开关:有蓝牙耳机 -> 关(保立体声),外放 -> 开(降噪)。返回是否真的切换了。
     private func applyVoiceProcessing() -> Bool {
         let input = engine.inputNode
         let wantVP = !hasBluetoothOutput
@@ -154,7 +140,6 @@ final class AudioManager {
             print("语音处理切换失败: \(error)")
         }
         voiceProcessingOn = input.isVoiceProcessingEnabled
-        relinkMixerToOutput()
         return true
     }
 
@@ -204,16 +189,12 @@ final class AudioManager {
 
         applyOutputOverride()
 
-        // 每次开始都按当前硬件声道数重连一次,确保耳机时是立体声
-        relinkMixerToOutput()
-
-        // 语音处理刚切换过:先空跑一次让硬件格式稳定下来,再按稳定后的格式重连
+        // 语音处理刚切换过:先空跑一次让硬件格式稳定下来
         if vpToggled {
             engine.prepare()
             try engine.start()
             Thread.sleep(forTimeInterval: 0.25)
             engine.stop()
-            relinkMixerToOutput()
         }
 
         installTap()
