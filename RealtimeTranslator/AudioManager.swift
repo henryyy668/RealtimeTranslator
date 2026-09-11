@@ -225,4 +225,75 @@ final class AudioManager {
     }
 
     func stop() {
-        running
+        running = false
+        engine.inputNode.removeTap(onBus: 0)
+        playerLeft.stop()
+        playerRight.stop()
+        engine.stop()
+    }
+
+    /// 把一段 TTS 缓冲调度到指定声道播放,播放完成后返回;超时也返回,绝不卡死
+    func play(buffers: [AVAudioPCMBuffer], onLeft: Bool) async {
+        guard !buffers.isEmpty else { return }
+        restartEngineIfNeeded()
+        let player = onLeft ? playerLeft : playerRight
+        let seconds = buffers.reduce(0.0) { $0 + Double($1.frameLength) / $1.format.sampleRate }
+        await waitPlayback(timeout: seconds + 3) { done in
+            for (index, buffer) in buffers.enumerated() {
+                if index == buffers.count - 1 {
+                    player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { _ in done() }
+                } else {
+                    player.scheduleBuffer(buffer)
+                }
+            }
+        }
+    }
+
+    // MARK: - 云端流式播放
+
+    func scheduleStream(_ buffer: AVAudioPCMBuffer, onLeft: Bool) {
+        restartEngineIfNeeded()
+        (onLeft ? playerLeft : playerRight).scheduleBuffer(buffer)
+    }
+
+    func finishStream(onLeft: Bool) async {
+        restartEngineIfNeeded()
+        guard let tail = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: 240) else { return }
+        tail.frameLength = 240
+        if let channel = tail.floatChannelData {
+            memset(channel[0], 0, Int(tail.frameLength) * MemoryLayout<Float>.size)
+        }
+        let player = onLeft ? playerLeft : playerRight
+        await waitPlayback(timeout: 12) { done in
+            player.scheduleBuffer(tail, completionCallbackType: .dataPlayedBack) { _ in done() }
+        }
+    }
+
+    private func waitPlayback(timeout: TimeInterval, schedule: (@escaping () -> Void) -> Void) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let once = ResumeOnce(cont)
+            schedule { once.resume() }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                once.resume()
+            }
+        }
+    }
+}
+
+private final class ResumeOnce {
+    private var resumed = false
+    private let lock = NSLock()
+    private let continuation: CheckedContinuation<Void, Never>
+
+    init(_ continuation: CheckedContinuation<Void, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !resumed else { return }
+        resumed = true
+        continuation.resume()
+    }
+}
