@@ -8,7 +8,7 @@ import AVFoundation
 ///
 /// 外放(手机喇叭 / 车机)时自动打开系统语音处理(回声消除 + 噪音抑制 + 自动增益)。
 /// 语音处理是单声道的,连着耳机时必须关掉;而且它会改变输出格式,
-/// 所以每次切换都把"混音器到输出"的连线拆掉重建,保证耳机时是立体声。
+/// 所以每次切换都按硬件实际声道数把"混音器到输出"的连线拆掉重建,保证耳机时是立体声。
 final class AudioManager {
     let engine = AVAudioEngine()
     private let playerLeft = AVAudioPlayerNode()
@@ -128,11 +128,15 @@ final class AudioManager {
         }
     }
 
-    /// 把混音器重新连到输出节点,让连线格式跟随当前硬件(耳机立体声 / 语音处理单声道)
+    /// 把混音器重新连到输出节点,明确按硬件声道数连线:耳机 2 声道保立体声,喇叭 / 语音处理按硬件实际声道
     private func relinkMixerToOutput() {
         guard graphBuilt else { return }
+        let hardware = engine.outputNode.outputFormat(forBus: 0)
+        let channels = max(1, min(2, hardware.channelCount))
+        let sampleRate = hardware.sampleRate > 0 ? hardware.sampleRate : 48_000
+        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: channels)
         engine.disconnectNodeOutput(engine.mainMixerNode)
-        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: nil)
+        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: format)
     }
 
     /// 按当前路由决定语音处理开关:有蓝牙耳机 -> 关(保立体声),外放 -> 开(降噪)。
@@ -200,10 +204,10 @@ final class AudioManager {
 
         applyOutputOverride()
 
-        // 每次开始都按当前输出格式重连一次,确保耳机时是立体声
+        // 每次开始都按当前硬件声道数重连一次,确保耳机时是立体声
         relinkMixerToOutput()
 
-        // 语音处理刚切换过:先空跑一次让硬件格式稳定下来
+        // 语音处理刚切换过:先空跑一次让硬件格式稳定下来,再按稳定后的格式重连
         if vpToggled {
             engine.prepare()
             try engine.start()
@@ -225,71 +229,4 @@ final class AudioManager {
         engine.inputNode.removeTap(onBus: 0)
         playerLeft.stop()
         playerRight.stop()
-        engine.stop()
-    }
-
-    /// 把一段 TTS 缓冲调度到指定声道播放,播放完成后返回;超时也返回,绝不卡死
-    func play(buffers: [AVAudioPCMBuffer], onLeft: Bool) async {
-        guard !buffers.isEmpty else { return }
-        restartEngineIfNeeded()
-        let player = onLeft ? playerLeft : playerRight
-        let seconds = buffers.reduce(0.0) { $0 + Double($1.frameLength) / $1.format.sampleRate }
-        await waitPlayback(timeout: seconds + 3) { done in
-            for (index, buffer) in buffers.enumerated() {
-                if index == buffers.count - 1 {
-                    player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { _ in done() }
-                } else {
-                    player.scheduleBuffer(buffer)
-                }
-            }
-        }
-    }
-
-    // MARK: - 云端流式播放
-
-    func scheduleStream(_ buffer: AVAudioPCMBuffer, onLeft: Bool) {
-        restartEngineIfNeeded()
-        (onLeft ? playerLeft : playerRight).scheduleBuffer(buffer)
-    }
-
-    func finishStream(onLeft: Bool) async {
-        restartEngineIfNeeded()
-        guard let tail = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: 240) else { return }
-        tail.frameLength = 240
-        if let channel = tail.floatChannelData {
-            memset(channel[0], 0, Int(tail.frameLength) * MemoryLayout<Float>.size)
-        }
-        let player = onLeft ? playerLeft : playerRight
-        await waitPlayback(timeout: 12) { done in
-            player.scheduleBuffer(tail, completionCallbackType: .dataPlayedBack) { _ in done() }
-        }
-    }
-
-    private func waitPlayback(timeout: TimeInterval, schedule: (@escaping () -> Void) -> Void) async {
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            let once = ResumeOnce(cont)
-            schedule { once.resume() }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-                once.resume()
-            }
-        }
-    }
-}
-
-private final class ResumeOnce {
-    private var resumed = false
-    private let lock = NSLock()
-    private let continuation: CheckedContinuation<Void, Never>
-
-    init(_ continuation: CheckedContinuation<Void, Never>) {
-        self.continuation = continuation
-    }
-
-    func resume() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !resumed else { return }
-        resumed = true
-        continuation.resume()
-    }
-}
+        engine
