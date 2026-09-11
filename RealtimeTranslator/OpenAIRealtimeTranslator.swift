@@ -26,7 +26,6 @@ final class OpenAIRealtimeTranslator {
         disconnect()
         speaker.reset()
         for target in [Lang.en, Lang.zh] {
-            // 两个会话都开源语言字幕,谁先到用谁,判断更快
             let socket = TranslationSocket(target: target, apiKey: apiKey, speaker: speaker)
             socket.onSourceText = { [weak self] text in self?.onSourceText?(text) }
             socket.onTargetText = { [weak self] text in self?.onTargetText?(text, target) }
@@ -104,7 +103,6 @@ final class OpenAIRealtimeTranslator {
     }
 }
 
-/// 当前说话人正在说的语言,由源语言字幕的文字系统推断,带最近更新时间
 private final class SpeakerLanguage {
     private var current: Lang?
     private var updatedAt = Date.distantPast
@@ -126,7 +124,6 @@ private final class SpeakerLanguage {
         updatedAt = Date()
     }
 
-    /// 最近 6 秒内听到的语言;更久没字幕就当不知道(放行)
     func recent() -> Lang? {
         lock.lock(); defer { lock.unlock() }
         guard Date().timeIntervalSince(updatedAt) < 6 else { return nil }
@@ -134,7 +131,6 @@ private final class SpeakerLanguage {
     }
 }
 
-/// 一个翻译会话:固定一个目标语言,输出先扣住 holdSeconds 再决定放不放
 private final class TranslationSocket {
     let target: Lang
     private let apiKey: String
@@ -222,7 +218,6 @@ private final class TranslationSocket {
         }
     }
 
-    /// 扣住一小段时间再判断:源语言 == 本路目标语言 -> 丢;不知道 -> 放
     private func hold(_ deliver: @escaping () -> Void) {
         queue.asyncAfter(deadline: .now() + holdSeconds) { [weak self] in
             guard let self, !self.closing else { return }
@@ -240,7 +235,6 @@ private final class TranslationSocket {
         case "session.input_transcript.delta":
             let delta = (obj["delta"] as? String) ?? ""
             speaker.observe(delta)
-            // 只用英文路的字幕更新界面,避免两路重复显示
             if target == .en { onSourceText?(delta) }
         case "session.output_audio.delta":
             guard let b64 = obj["delta"] as? String, let audio = Data(base64Encoded: b64) else { return }
