@@ -2,11 +2,10 @@ import AVFoundation
 
 /// 音频中枢:负责音频会话配置、麦克风采集、以及把两路译文分别送进左右声道。
 ///
-/// 一副耳机(如 AirPods)对系统来说是一个立体声输出设备,
-/// 你戴左耳、朋友戴右耳,中文译文只 pan 到左声道、英文译文只 pan 到右声道。
-/// 收音始终用 iPhone 自带麦克风,耳机保持 A2DP 高音质输出。
-///
-/// 外放(手机喇叭 / 车机)时自动打开系统语音处理(回声消除 + 噪音抑制 + 自动增益)。
+/// 一副耳机(如 AirPods)对系统来说是一个立体声输出设备,你戴左耳、朋友戴右耳。
+/// 每段 TTS 是单声道,播放前手动铺成立体声:送左耳时只填左轨、右轨填零,反之亦然。
+/// 这样输出天生就是立体声,不依赖引擎的格式重连,稳定。
+/// 收音始终用 iPhone 自带麦克风。外放时自动打开系统语音处理(回声消除 + 噪音抑制 + 自动增益)。
 final class AudioManager {
     let engine = AVAudioEngine()
     private let playerLeft = AVAudioPlayerNode()
@@ -15,8 +14,11 @@ final class AudioManager {
     private var graphBuilt = false
     private var running = false
 
-    /// TTS 播放统一转换到的单声道格式,经 pan 混入立体声输出
+    /// TTS 合成 / 转换统一用的单声道格式
     let playbackFormat = AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1)!
+
+    /// 播放器实际接收的立体声格式
+    private let stereoFormat = AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 2)!
 
     /// 每个麦克风缓冲的回调(音频线程调用)
     var onBuffer: ((AVAudioPCMBuffer) -> Void)?
@@ -126,7 +128,6 @@ final class AudioManager {
         }
     }
 
-    /// 按当前路由决定语音处理开关:有蓝牙耳机 -> 关(保立体声),外放 -> 开(降噪)。返回是否真的切换了。
     private func applyVoiceProcessing() -> Bool {
         let input = engine.inputNode
         let wantVP = !hasBluetoothOutput
@@ -152,7 +153,6 @@ final class AudioManager {
         }
     }
 
-    /// 耳机连上 / 断开后,如果语音处理状态和新路由不匹配,停下引擎重配一次
     private func reconfigureForRouteIfNeeded() {
         guard running, graphBuilt else { return }
         let input = engine.inputNode
@@ -180,16 +180,13 @@ final class AudioManager {
         if !graphBuilt {
             engine.attach(playerLeft)
             engine.attach(playerRight)
-            engine.connect(playerLeft, to: engine.mainMixerNode, format: playbackFormat)
-            engine.connect(playerRight, to: engine.mainMixerNode, format: playbackFormat)
-            playerLeft.pan = -1.0
-            playerRight.pan = 1.0
+            engine.connect(playerLeft, to: engine.mainMixerNode, format: stereoFormat)
+            engine.connect(playerRight, to: engine.mainMixerNode, format: stereoFormat)
             graphBuilt = true
         }
 
         applyOutputOverride()
 
-        // 语音处理刚切换过:先空跑一次让硬件格式稳定下来
         if vpToggled {
             engine.prepare()
             try engine.start()
@@ -213,6 +210,24 @@ final class AudioManager {
         engine.stop()
     }
 
+    /// 把单声道 buffer 铺成立体声:onLeft 时只填左轨、右轨静音,反之亦然
+    private func toStereo(_ mono: AVAudioPCMBuffer, onLeft: Bool) -> AVAudioPCMBuffer? {
+        guard let src = mono.floatChannelData?[0],
+              let out = AVAudioPCMBuffer(pcmFormat: stereoFormat, frameCapacity: mono.frameLength) else {
+            return nil
+        }
+        out.frameLength = mono.frameLength
+        let n = Int(mono.frameLength)
+        let left = out.floatChannelData![0]
+        let right = out.floatChannelData![1]
+        for i in 0..<n {
+            let s = src[i]
+            left[i] = onLeft ? s : 0
+            right[i] = onLeft ? 0 : s
+        }
+        return out
+    }
+
     /// 把一段 TTS 缓冲调度到指定声道播放,播放完成后返回;超时也返回,绝不卡死
     func play(buffers: [AVAudioPCMBuffer], onLeft: Bool) async {
         guard !buffers.isEmpty else { return }
@@ -221,10 +236,11 @@ final class AudioManager {
         let seconds = buffers.reduce(0.0) { $0 + Double($1.frameLength) / $1.format.sampleRate }
         await waitPlayback(timeout: seconds + 3) { done in
             for (index, buffer) in buffers.enumerated() {
+                let stereo = self.toStereo(buffer, onLeft: onLeft) ?? buffer
                 if index == buffers.count - 1 {
-                    player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { _ in done() }
+                    player.scheduleBuffer(stereo, completionCallbackType: .dataPlayedBack) { _ in done() }
                 } else {
-                    player.scheduleBuffer(buffer)
+                    player.scheduleBuffer(stereo)
                 }
             }
         }
@@ -234,15 +250,17 @@ final class AudioManager {
 
     func scheduleStream(_ buffer: AVAudioPCMBuffer, onLeft: Bool) {
         restartEngineIfNeeded()
-        (onLeft ? playerLeft : playerRight).scheduleBuffer(buffer)
+        guard let stereo = toStereo(buffer, onLeft: onLeft) else { return }
+        (onLeft ? playerLeft : playerRight).scheduleBuffer(stereo)
     }
 
     func finishStream(onLeft: Bool) async {
         restartEngineIfNeeded()
-        guard let tail = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: 240) else { return }
+        guard let tail = AVAudioPCMBuffer(pcmFormat: stereoFormat, frameCapacity: 240) else { return }
         tail.frameLength = 240
-        if let channel = tail.floatChannelData {
-            memset(channel[0], 0, Int(tail.frameLength) * MemoryLayout<Float>.size)
+        if let l = tail.floatChannelData?[0], let r = tail.floatChannelData?[1] {
+            memset(l, 0, Int(tail.frameLength) * MemoryLayout<Float>.size)
+            memset(r, 0, Int(tail.frameLength) * MemoryLayout<Float>.size)
         }
         let player = onLeft ? playerLeft : playerRight
         await waitPlayback(timeout: 12) { done in
